@@ -8,6 +8,7 @@ local M = {}
 ---@field number integer
 ---@field base string
 ---@field head_sha string
+---@field worktree? string
 
 ---@class prreview.Suggestion
 ---@field lines string[]
@@ -94,6 +95,27 @@ function M.serialize(b)
   end
   -- anchor the review to the commit reviewed, not whatever HEAD has moved to since
   return { event = b.verdict, commit_id = b.pr.head_sha, body = b.body, comments = comments }
+end
+
+--- Replace `path`'s HUMAN draft suggestions with `entries`; leaves verified entries,
+--- comments, other files' entries, and any claude-origin drafts untouched. Used by the
+--- save→draft pipeline (which only ever stages origin="human" drafts) so re-saving a
+--- file doesn't accumulate duplicate human drafts, without clobbering Claude's drafts
+--- on the same path.
+---@param b prreview.Batch
+---@param path string
+---@param entries prreview.Comment[]
+function M.replace_drafts_for_path(b, path, entries)
+  local kept = {}
+  for _, c in ipairs(b.comments) do
+    if not (c.path == path and c.status == "draft" and c.kind == "suggestion" and c.origin == "human") then
+      kept[#kept + 1] = c
+    end
+  end
+  b.comments = kept
+  for _, e in ipairs(entries) do
+    M.add(b, e)
+  end
 end
 
 return M

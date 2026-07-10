@@ -59,6 +59,24 @@ local function resolve_pr(arg)
   return { owner = ref.owner, repo = ref.repo, number = ref.number, base = info.base, head_sha = info.head_sha }
 end
 
+--- Create the review worktree at `wt` on branch review/pr-<n>-suggestions checked
+--- out at pr.head_sha, retrying once behind a prune (add refuses a stale admin
+--- entry that prune clears). Notifies and returns false on hard failure.
+---@param pr prreview.PR
+---@param wt string
+---@return boolean ok
+local function create_worktree(pr, wt)
+  local branch = ("review/pr-%d-suggestions"):format(pr.number)
+  if gh.run(gh.worktree_add_cmd(wt, branch, pr.head_sha)).code ~= 0 then
+    gh.run(gh.worktree_prune_cmd())
+    if gh.run(gh.worktree_add_cmd(wt, branch, pr.head_sha)).code ~= 0 then
+      vim.notify("prreview: could not create the review worktree at " .. wt, vim.log.levels.ERROR)
+      return false
+    end
+  end
+  return true
+end
+
 ---@param arg string
 function M.start(arg)
   local pr = resolve_pr(arg)
@@ -75,6 +93,41 @@ function M.start(arg)
     vim.notify("prreview: git fetch of PR head failed", vim.log.levels.ERROR)
     return
   end
+  local wt = state.worktree_path(pr)
+  pr.worktree = wt
+  if not vim.uv.fs_stat(wt) then
+    if not create_worktree(pr, wt) then
+      return
+    end
+  else
+    -- a worktree left over from an unclosed prior session (crash, reboot, no :PrReviewClose)
+    -- can sit on a stale head, or be a broken/partial dir; the save→draft diff below is
+    -- computed against the freshly-fetched pr.head_sha, so anything but an exact match here
+    -- would silently stage garbage suggestions.
+    local cur = gh.run(gh.worktree_head_cmd(wt))
+    if cur.code ~= 0 then
+      -- not a usable worktree (partial/corrupt dir, or a dangling admin entry): rebuild it.
+      -- `delete -rf` wipes untracked files too, so warn — a :w'd-but-undrafted new file here is lost.
+      vim.notify(
+        "prreview: review worktree was broken — rebuilding it; any un-drafted edits in it are discarded",
+        vim.log.levels.WARN
+      )
+      gh.run(gh.worktree_remove_cmd(wt))
+      if vim.uv.fs_stat(wt) then
+        vim.fn.delete(wt, "rf") -- stray dir `worktree remove` won't own
+      end
+      gh.run(gh.worktree_prune_cmd())
+      if not create_worktree(pr, wt) then
+        return
+      end
+    elseif vim.trim(cur.stdout) ~= pr.head_sha then
+      vim.notify(
+        "prreview: existing worktree was stale (PR moved) — resetting to the current head",
+        vim.log.levels.WARN
+      )
+      gh.run({ "git", "-C", wt, "reset", "--hard", pr.head_sha })
+    end
+  end
   current_pr = pr
   state.write_active(pr, string.format("https://github.com/%s/%s/pull/%d", pr.owner, pr.repo, pr.number))
   if not vim.uv.fs_stat(state.batch_path(pr)) then
@@ -82,6 +135,58 @@ function M.start(arg)
   end
   diff.open(pr.base)
   overlay.refresh(pr)
+
+  local diffparse = require("ai-review.diffparse")
+  -- Assumes one active review at a time, like PipPrReviewOverlay below: this augroup's
+  -- BufWritePost pattern is pinned to whatever review was most recently started.
+  local grp = vim.api.nvim_create_augroup("PrReviewEdit", { clear = true })
+  vim.api.nvim_create_autocmd("User", {
+    group = grp,
+    pattern = "DiffviewDiffBufWinEnter",
+    callback = function()
+      -- fires for whichever diff buffer is entered (both sides); the RIGHT-only guard lives in M.suggest
+      vim.keymap.set("n", "i", "<cmd>PrSuggest<cr>", { buffer = 0, desc = "PR: edit on branch to suggest" })
+      vim.keymap.set("n", "<leader>re", "<cmd>PrSuggest<cr>", { buffer = 0, desc = "PR: edit on branch to suggest" })
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufWritePost", {
+    group = grp,
+    pattern = current_pr.worktree .. "/*",
+    callback = function(a)
+      if not current_pr then -- fired after :PrReviewClose tore down the worktree
+        return
+      end
+      -- <amatch> (unlike <afile>) is always the full expanded path, so this holds
+      -- even if the file was opened via a relative path (e.g. after :lcd into the worktree)
+      local rel = a.match:sub(#current_pr.worktree + 2) -- strip "<wt>/"
+      local r = gh.run({ "git", "-C", current_pr.worktree, "diff", "-U0", current_pr.head_sha, "--", rel })
+      if r.code ~= 0 then
+        vim.notify("prreview: could not diff " .. rel .. ": " .. r.stderr, vim.log.levels.WARN)
+        return
+      end
+      local entries = {}
+      for _, h in ipairs(diffparse.parse(r.stdout)) do
+        local e = diffparse.to_entry(h)
+        if e then
+          entries[#entries + 1] = vim.tbl_extend("force", e, {
+            path = rel,
+            kind = "suggestion",
+            origin = "human",
+            status = "draft",
+            body = "",
+          })
+        end
+        -- pure insertions (to_entry == nil) are intentionally skipped in v1; not silently
+        -- claimed as handled, just not yet anchored to a following-line suggestion
+      end
+      local b = state.load_or_init_batch(current_pr)
+      batch.replace_drafts_for_path(b, rel, entries)
+      state.save_batch(b)
+      overlay.refresh(current_pr)
+      vim.notify(("prreview: staged %d draft suggestion(s) for %s"):format(#entries, rel))
+    end,
+  })
+
   vim.notify(("prreview: reviewing %s/%s#%d"):format(pr.owner, pr.repo, pr.number))
 end
 
@@ -106,51 +211,26 @@ local function add_comment(kind)
   end)
 end
 
+--- Open the file under the cursor from the review worktree, at the cursor line, in a
+--- vsplit — a real file on the branch, so LSP/formatting work. Editing + :w stages a draft.
 function M.suggest()
   if not current_pr then
     vim.notify("prreview: no active review (:PrReviewStart)", vim.log.levels.ERROR)
     return
   end
   local anchor = diff.cursor_anchor()
-  if not anchor or anchor.side ~= "RIGHT" then
-    vim.notify("prreview: select lines on the PR (right) side to suggest", vim.log.levels.ERROR)
+  if not anchor then
     return
   end
-  local lo = anchor.start_line or anchor.line
-  local lines = vim.api.nvim_buf_get_lines(0, lo - 1, anchor.line, false)
-  local scratch = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_lines(scratch, 0, -1, false, lines)
-  vim.bo[scratch].bufhidden = "wipe"
-  vim.cmd("botright split")
-  vim.api.nvim_win_set_buf(0, scratch)
-  vim.notify("prreview: edit the replacement, then :w to stage the suggestion")
-  vim.api.nvim_create_autocmd("BufWriteCmd", {
-    buffer = scratch,
-    once = true,
-    callback = function()
-      local edited = vim.api.nvim_buf_get_lines(scratch, 0, -1, false)
-      vim.ui.input({ prompt = "suggestion note: " }, function(body)
-        if body == nil then -- Esc-cancelled: don't stage a draft
-          return
-        end
-        local b = state.load_or_init_batch(current_pr)
-        batch.add(
-          b,
-          vim.tbl_extend("force", anchor, {
-            kind = "suggestion",
-            origin = "human",
-            status = "draft",
-            body = body or "",
-            suggestion = { lines = edited },
-          })
-        )
-        state.save_batch(b)
-        overlay.refresh(current_pr)
-        vim.cmd("close")
-        vim.notify("prreview: staged draft suggestion — Claude will verify it")
-      end)
-    end,
-  })
+  local wt = current_pr.worktree or state.worktree_path(current_pr)
+  vim.cmd("vsplit " .. vim.fn.fnameescape(wt .. "/" .. anchor.path))
+  if anchor.side == "RIGHT" then
+    pcall(vim.api.nvim_win_set_cursor, 0, { anchor.line, 0 })
+  else
+    -- anchor.line is a BASE-side line number; it doesn't correspond 1:1 to a line in the
+    -- head-checked-out worktree file, so jumping there would silently land on the wrong line
+    vim.notify("prreview: opened on the PR branch — LEFT-side line numbers don't map here", vim.log.levels.WARN)
+  end
 end
 
 function M.submit()
@@ -206,6 +286,22 @@ function M.setup(opts)
     end
   end, {})
   vim.api.nvim_create_user_command("PrReviewSubmit", M.submit, {})
+  vim.api.nvim_create_user_command("PrReviewClose", function()
+    if not current_pr then
+      vim.notify("prreview: no active review", vim.log.levels.WARN)
+      return
+    end
+    local wt = current_pr.worktree or state.worktree_path(current_pr)
+    if vim.uv.fs_stat(wt) then
+      gh.run(gh.worktree_remove_cmd(wt))
+      gh.run(gh.worktree_prune_cmd())
+    end
+    pcall(vim.fn.delete, state.active_path()) -- clear active.json
+    overlay.clear()
+    current_pr = nil
+    vim.api.nvim_create_augroup("PrReviewEdit", { clear = true }) -- drop the now-stale worktree BufWritePost pattern
+    vim.notify("prreview: review closed; worktree removed")
+  end, {})
   -- diffview fires this on every file navigation (not just initial open), so
   -- re-render there to keep the overlay pinned to whatever file is now shown.
   -- `clear = true` (not just a named group) makes re-running setup() idempotent

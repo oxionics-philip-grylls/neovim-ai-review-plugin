@@ -1,4 +1,4 @@
--- End-to-end integration test for pip.prreview against a synthetic GitHub PR built
+-- End-to-end integration test for ai-review against a synthetic GitHub PR built
 -- in a throwaway local repo (base branch + refs/pull/1/head). The two network calls
 -- (gh pr view, the URL guard's remote parse) and vim.ui.input are stubbed; the git
 -- fetches, diffview split, batch persistence, and serialization are exercised for real.
@@ -7,7 +7,7 @@
 -- FETCH_HEAD on the base so the diff comes out empty.
 
 -- diffview is a runtime dep, not on the test rtp by default; put it there before any
--- require of pip.prreview.diff (which requires diffview.lib at load time).
+-- require of ai-review.diff (which requires diffview.lib at load time).
 local diffview_dir = vim.fn.stdpath("data") .. "/lazy/diffview.nvim"
 local have_diffview = vim.fn.isdirectory(diffview_dir) == 1
 if have_diffview then
@@ -20,6 +20,22 @@ end
 
 local function sh(cmd)
   return vim.trim(vim.fn.system(cmd))
+end
+
+-- DiffviewClose kicks off async teardown coroutines; a subsequent DiffviewOpen that
+-- races them intermittently dies ("Could not find the Git directory!") or fails to
+-- select real buffers. Poll for teardown instead of a fixed sleep, both between two
+-- opens within one test and across tests in after_each.
+local function close_diffview_and_wait()
+  pcall(vim.cmd, "DiffviewClose")
+  vim.wait(2000, function()
+    return require("diffview.lib").get_current_view() == nil
+  end, 20)
+  -- get_current_view() clears synchronously inside the close, so the poll above
+  -- resolves ~instantly and doesn't by itself wait out the async teardown
+  -- (watcher:close(), file:destroy(), ...) that runs after. Pump the loop a bit
+  -- longer so those coroutines actually drain before the next DiffviewOpen.
+  vim.wait(150)
 end
 
 describe("ai-review end-to-end", function()
@@ -84,7 +100,7 @@ describe("ai-review end-to-end", function()
   end)
 
   after_each(function()
-    pcall(vim.cmd, "DiffviewClose")
+    close_diffview_and_wait()
     if orig_cwd then
       vim.cmd.cd(orig_cwd)
     end
@@ -207,5 +223,76 @@ describe("ai-review end-to-end", function()
     local base_marks = vim.api.nvim_buf_get_extmarks(base_buf, ns, 0, -1, {})
     assert.is_true(#head_marks > 0)
     assert.are.equal(0, #base_marks)
+  end)
+
+  it("creates the review worktree on start and removes it on close", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    local wt = state.worktree_path({ owner = "test", repo = "repo", number = 1 }, troot)
+    assert.is_not_nil(vim.uv.fs_stat(wt))
+    assert.is_not_nil(require("ai-review.state").read_active(troot).worktree)
+    vim.cmd("PrReviewClose")
+    assert.is_nil(vim.uv.fs_stat(wt))
+  end)
+
+  it("staging: editing a worktree file on save produces a draft suggestion", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    local wt = state.worktree_path({ owner = "test", repo = "repo", number = 1 }, troot)
+    local f = wt .. "/file.txt"
+    -- open the file so BufWritePost fires under the autocmd; edit the live buffer (not the
+    -- file on disk out-of-band) so the second :write below doesn't trip Vim's blocking
+    -- "file changed since reading" y/n prompt, which hangs headless (no stdin to answer it)
+    vim.cmd("edit " .. vim.fn.fnameescape(f))
+    vim.api.nvim_buf_set_lines(0, 1, 2, false, { "SUGGESTED line 2" })
+    vim.cmd("write")
+    local b = state.load_or_init_batch({ owner = "test", repo = "repo", number = 1 })
+    local drafts = {}
+    for _, c in ipairs(b.comments) do
+      if c.status == "draft" and c.kind == "suggestion" then
+        drafts[#drafts + 1] = c
+      end
+    end
+    assert.are.equal(1, #drafts)
+    assert.are.equal("file.txt", drafts[1].path)
+    assert.are.equal("RIGHT", drafts[1].side)
+    assert.are.equal(2, drafts[1].line)
+    assert.are.same({ "SUGGESTED line 2" }, drafts[1].suggestion.lines)
+    -- re-save with a further edit: still one draft for the file (no accumulation)
+    vim.api.nvim_buf_set_lines(0, 1, 2, false, { "SUGGESTED again" })
+    vim.cmd("write")
+    local b2 = state.load_or_init_batch({ owner = "test", repo = "repo", number = 1 })
+    local n = 0
+    for _, c in ipairs(b2.comments) do
+      if c.status == "draft" then
+        n = n + 1
+      end
+    end
+    assert.are.equal(1, n)
+  end)
+  it("resets a stale worktree to the current head on re-start", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    local wt = state.worktree_path({ owner = "test", repo = "repo", number = 1 }, troot)
+    local head = vim.trim(sh("git rev-parse origin/master"))
+    -- move the worktree off the current head (FETCH_HEAD is the PR head, a different commit)
+    local other = vim.trim(sh("git rev-parse FETCH_HEAD"))
+    assert.are_not.equal(head, other)
+    sh("git -C " .. wt .. " reset --hard " .. other)
+    close_diffview_and_wait()
+    pr.start("https://github.com/test/repo/pull/1")
+    assert.are.equal(head, vim.trim(sh("git -C " .. wt .. " rev-parse HEAD")))
+    vim.cmd("PrReviewClose")
+  end)
+
+  it("rebuilds a broken worktree dir on re-start", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    local wt = state.worktree_path({ owner = "test", repo = "repo", number = 1 }, troot)
+    -- corrupt it: drop the gitdir link so `rev-parse HEAD` fails inside the worktree
+    vim.fn.delete(wt .. "/.git", "rf")
+    assert.are_not.equal(0, gh.run(gh.worktree_head_cmd(wt)).code)
+    close_diffview_and_wait()
+    pr.start("https://github.com/test/repo/pull/1")
+    local after = gh.run(gh.worktree_head_cmd(wt))
+    assert.are.equal(0, after.code)
+    assert.are.equal(vim.trim(sh("git rev-parse origin/master")), vim.trim(after.stdout))
+    vim.cmd("PrReviewClose")
   end)
 end)

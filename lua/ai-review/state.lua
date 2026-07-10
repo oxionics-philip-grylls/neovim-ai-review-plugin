@@ -22,6 +22,13 @@ function M.active_path(root)
   return (root or M.default_root()) .. "/active.json"
 end
 
+---@param pr prreview.PR
+---@param root? string
+---@return string
+function M.worktree_path(pr, root)
+  return string.format("%s/wt/%s__%s__pr%d", root or M.default_root(), pr.owner, pr.repo, pr.number)
+end
+
 ---@param path string
 ---@param text string
 local function write_file(path, text)
@@ -59,6 +66,7 @@ function M.write_active(pr, pr_url, root)
       head_sha = pr.head_sha,
       pr_url = pr_url,
       batch_path = M.batch_path(pr, root),
+      worktree = pr.worktree,
     })
   )
 end

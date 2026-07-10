@@ -25,6 +25,26 @@ function M.post_review_cmd(owner, repo, number, input_path)
   }
 end
 
+---@return string[]
+function M.worktree_add_cmd(wt, branch, head_sha)
+  return { "git", "worktree", "add", "-B", branch, wt, head_sha }
+end
+
+---@return string[]
+function M.worktree_remove_cmd(wt)
+  return { "git", "worktree", "remove", "--force", wt }
+end
+
+---@return string[]
+function M.worktree_prune_cmd()
+  return { "git", "worktree", "prune" }
+end
+
+---@return string[]
+function M.worktree_head_cmd(wt)
+  return { "git", "-C", wt, "rev-parse", "HEAD" }
+end
+
 ---@param cmd string[]
 ---@return { code: integer, stdout: string, stderr: string }
 function M.run(cmd)

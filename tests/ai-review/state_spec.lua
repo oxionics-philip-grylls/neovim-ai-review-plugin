@@ -40,4 +40,9 @@ describe("ai-review.state", function()
     assert.are.equal(0, #b.comments)
     vim.fn.delete(root, "rf")
   end)
+
+  it("derives the worktree path", function()
+    local wtpr = { owner = "o", repo = "r", number = 5 }
+    assert.are.equal("/root/wt/o__r__pr5", state.worktree_path(wtpr, "/root"))
+  end)
 end)

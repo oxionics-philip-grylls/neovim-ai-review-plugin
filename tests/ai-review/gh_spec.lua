@@ -18,4 +18,14 @@ describe("ai-review.gh command builders", function()
       gh.post_review_cmd("o", "r", 5, "/tmp/x.json")
     )
   end)
+
+  it("builds worktree add/remove/prune commands", function()
+    assert.are.same(
+      { "git", "worktree", "add", "-B", "review/pr-5-suggestions", "/wt/x", "deadbeef" },
+      gh.worktree_add_cmd("/wt/x", "review/pr-5-suggestions", "deadbeef")
+    )
+    assert.are.same({ "git", "worktree", "remove", "--force", "/wt/x" }, gh.worktree_remove_cmd("/wt/x"))
+    assert.are.same({ "git", "worktree", "prune" }, gh.worktree_prune_cmd())
+    assert.are.same({ "git", "-C", "/wt/x", "rev-parse", "HEAD" }, gh.worktree_head_cmd("/wt/x"))
+  end)
 end)

@@ -42,6 +42,12 @@ Never set `verdict` — the human owns it and submits via `:PrReviewSubmit`.
 
 ## 2. Set up the parallel verification branch (worktree)
 
+When driven from Neovim (`active.json` present), **reuse the plugin's worktree** at
+`active.json.worktree` — it is already a checkout of `review/pr-<n>-suggestions` off the PR head.
+Do **not** `git worktree add` your own; the human edits the same branch there (their `:w` stages
+`draft` suggestions you then verify). The `git worktree add` fallback below applies only to reviews
+not started from Neovim.
+
 A branch off the PR head, in its own worktree, where every proposed fix is implemented **and tested** before you suggest it. The author's branch is never touched:
 - `git worktree add -b review/pr-<n>-suggestions <path> FETCH_HEAD` — branched off the PR head, so its post-image line numbers line up with the PR's RIGHT side (this is what lets you anchor suggestion blocks correctly).
 - This branch serves three jobs: **prove** each fix builds and passes tests, **source** the exact replacement lines for `suggestion` blocks, and **carry** any last-resort fix that can't be delivered as suggestion blocks (§5). The usual "merge back, then remove the worktree" rule does **not** apply — it's never merged into your own line.
@@ -62,7 +68,7 @@ For each file, in order:
 ## 5. Turn agreed fixes into verified, deliverable suggestions — by delegating
 
 When a file's actionable comments are settled, for each fix:
-1. **Implement it** — launch a worker subagent (via the Agent tool; `rust-developer`, `python-experiment-dev`, match the file) to make the change **on the verification branch**. For comment/docstring wording, use the repo's comment-style reviewer.
+1. **Implement it** — launch a worker subagent (via the Agent tool; `rust-developer`, `python-experiment-dev`, match the file) to make the change **on the verification branch** — in the shared worktree (`active.json.worktree`) when Neovim-driven. For comment/docstring wording, use the repo's comment-style reviewer.
 2. **Review it** — when the worker returns, **you** run the `code-reviewer` agent over its change and address findings (workers don't self-review).
 3. **Test it** — build and run the **scoped** tests for what the fix touches (`poe test*`, scoped to the file/area; never `hitl`/`canary`). **Only propose fixes that pass.** If a fix can't be made to build/pass, that's review signal in itself — say so to the author rather than suggesting broken code.
 4. **Commit it** — one focused commit per fix, message naming the file and the issue, so it maps **1:1** to the review comment. Record the SHA.
