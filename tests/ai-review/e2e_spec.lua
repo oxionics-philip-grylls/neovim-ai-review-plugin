@@ -100,6 +100,7 @@ describe("ai-review end-to-end", function()
   end)
 
   after_each(function()
+    require("ai-review")._stop_watch() -- stop the batch fs-watcher before deleting troot
     close_diffview_and_wait()
     if orig_cwd then
       vim.cmd.cd(orig_cwd)
@@ -294,5 +295,43 @@ describe("ai-review end-to-end", function()
     assert.are.equal(0, after.code)
     assert.are.equal(vim.trim(sh("git rev-parse origin/master")), vim.trim(after.stdout))
     vim.cmd("PrReviewClose")
+  end)
+
+  it("re-renders when the batch file is flipped draft->verified out-of-band", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    -- stage a draft via the batch directly, render, confirm it shows as draft
+    local prkey = { owner = "test", repo = "repo", number = 1 }
+    local b = state.load_or_init_batch(prkey)
+    batch.add(b, {
+      path = "file.txt",
+      side = "RIGHT",
+      line = 2,
+      kind = "suggestion",
+      origin = "human",
+      status = "draft",
+      body = "x",
+      suggestion = { lines = { "y" } },
+    })
+    state.save_batch(b)
+    require("ai-review.overlay").refresh(prkey)
+    -- flip it to verified out-of-band (as peer-review would), then wait for the fs-watcher
+    local b2 = state.load_or_init_batch(prkey)
+    b2.comments[#b2.comments].status = "verified"
+    state.save_batch(b2)
+    -- the watcher debounces ~200ms; wait until an extmark carries the verified decoration
+    local ns = vim.api.nvim_create_namespace("pip_prreview")
+    local got_verified = vim.wait(3000, function()
+      for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+        for _, m in ipairs(vim.api.nvim_buf_get_extmarks(bufnr, ns, 0, -1, { details = true })) do
+          local vl = m[4] and m[4].virt_lines
+          if vl and vl[1] and vl[1][1] and vl[1][1][1]:find("✓", 1, true) then
+            return true
+          end
+        end
+      end
+      return false
+    end, 50)
+    assert.is_true(got_verified, "verified flip did not re-render within 3s")
+    close_diffview_and_wait()
   end)
 end)

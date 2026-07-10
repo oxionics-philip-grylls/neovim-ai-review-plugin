@@ -235,3 +235,31 @@ describe("ai-review.batch.replace_drafts_for_path", function()
     }, kinds)
   end)
 end)
+
+describe("ai-review.batch.add id uniqueness", function()
+  local pr = { owner = "o", repo = "r", number = 5, base = "master", head_sha = "abc" }
+  local function draft(line, origin)
+    return {
+      path = "a",
+      side = "RIGHT",
+      line = line,
+      kind = "suggestion",
+      origin = origin,
+      status = origin == "claude" and "verified" or "draft",
+      body = "",
+      suggestion = { lines = { tostring(line) } },
+    }
+  end
+  it("keeps ids unique among current entries after replace removes+re-adds", function()
+    local b = batch.new(pr)
+    batch.add(b, draft(1, "human"))
+    batch.add(b, draft(2, "claude"))
+    batch.add(b, draft(3, "human"))
+    batch.replace_drafts_for_path(b, "a", { draft(4, "human") })
+    local seen = {}
+    for _, c in ipairs(b.comments) do
+      assert.is_nil(seen[c.id], "duplicate id: " .. tostring(c.id))
+      seen[c.id] = true
+    end
+  end)
+end)

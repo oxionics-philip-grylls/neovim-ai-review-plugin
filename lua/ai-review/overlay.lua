@@ -30,6 +30,18 @@ function M.clear()
   end
 end
 
+--- Highlight group + tag suffix for a batch entry, by status/kind.
+---@param c prreview.Comment
+---@return string hl, string tag_suffix
+function M.decorate(c)
+  if c.status == "draft" then
+    return "DiagnosticWarn", " draft"
+  elseif c.status == "verified" and c.kind == "suggestion" then
+    return "DiagnosticOk", " ✓"
+  end
+  return "Comment", ""
+end
+
 ---@param b prreview.Batch
 function M.render(b)
   local view = require("diffview.lib").get_current_view()
@@ -46,8 +58,8 @@ function M.render(b)
     if c.path == path then
       local bufnr = c.side == "RIGHT" and head_buf or base_buf
       if bufnr then
-        local tag = ("[%s%s] %s"):format(c.origin, c.status == "draft" and " draft" or "", c.body)
-        local hl = c.status == "draft" and "DiagnosticWarn" or "Comment"
+        local hl, suffix = M.decorate(c)
+        local tag = ("[%s%s] %s"):format(c.origin, suffix, c.body)
         pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, c.line - 1, 0, {
           virt_lines = { { { "  ▸ " .. tag, hl } } },
           virt_lines_above = false,

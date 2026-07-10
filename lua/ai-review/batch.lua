@@ -42,7 +42,17 @@ end
 ---@param entry prreview.Comment
 ---@return string id
 function M.add(b, entry)
-  entry.id = "c" .. (#b.comments + 1)
+  -- Allocate max-existing-suffix + 1, not #comments + 1: after replace_drafts_for_path
+  -- removes then re-adds entries, a positional id could collide with a surviving entry's.
+  -- peer-review flips drafts by id, so ids must stay unique among current entries.
+  local max = 0
+  for _, c in ipairs(b.comments) do
+    local n = tonumber(tostring(c.id or ""):match("^c(%d+)$") or "")
+    if n and n > max then
+      max = n
+    end
+  end
+  entry.id = "c" .. (max + 1)
   b.comments[#b.comments + 1] = entry
   return entry.id
 end

@@ -80,6 +80,25 @@ When a file's actionable comments are settled, for each fix:
 - **Serialize the commits.** Don't fan out concurrent committers on one branch — parallel commits race the index. The file-by-file cadence serialises this naturally.
 - You **orchestrate**; you don't edit code in this thread. Report the change, the review verdict, the test result, the SHA, and which delivery it'll use — then continue.
 
+### 5b. Verify the human's draft suggestions (Neovim-driven)
+
+When the plugin nudges you ("new draft suggestion(s) in <batch> — verify and flip to verified"),
+process the batch at `active.json.batch_path`:
+
+- For each entry with `status: "draft"` and `kind: "suggestion"`: the human's replacement is already
+  applied in the shared worktree (`active.json.worktree`). Build + run the scoped tests for what it
+  touches (`poe test*`, never hitl/canary). On pass, set `status: "verified"` and record
+  `suggestion.verified_sha` (the worktree HEAD after committing the fix, per §5's usual flow). On
+  fail, downgrade it: set `kind: "comment"`, drop the `suggestion` block, and set `body` to explain
+  why it couldn't be verified — never leave a broken suggestion block.
+- **Write back concurrency-safely.** Verification takes seconds, during which the human may `:w`
+  another file and stage new drafts into the *same* batch. Do NOT rewrite the whole batch from the
+  copy you read at the start — that silently drops any entry added meanwhile. Immediately before
+  writing, **re-read** the batch and apply your changes only to the specific entries you verified
+  (match by `id`), leaving every other entry untouched; then write **atomically** (tmp + rename) so
+  the plugin's file-watcher sees a complete file and re-renders (draft badges flip to ✓).
+- You never set `verdict` — the human owns it and submits via `:PrReviewSubmit`.
+
 ## 6. Capture cross-cutting issues as handoffs
 
 When the review surfaces something that doesn't belong in a fix — a design decision the author must make, a refactor out of scope, a problem owned by another component — make it a **plain review comment** (and, if it needs tracking, a note under `.claude/notes/`). Don't force out-of-scope work into a suggestion; "here's the concern, here's why, your call" is the right output.

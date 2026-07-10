@@ -6,10 +6,59 @@ local state = require("ai-review.state")
 local gh = require("ai-review.gh")
 local diff = require("ai-review.diff")
 local overlay = require("ai-review.overlay")
+local nudge = require("ai-review.nudge")
 
 local M = {}
 ---@type prreview.PR?
 local current_pr = nil
+---@type uv.uv_fs_event_t?
+M._watch = nil
+
+--- Stop the batch fs-watcher (idempotent).
+function M._stop_watch()
+  if M._watch then
+    pcall(function()
+      M._watch:stop()
+      M._watch:close()
+    end)
+    M._watch = nil
+  end
+end
+
+--- Watch the batch's PARENT DIRECTORY (not the file itself), filtered to its basename.
+--- state.save_batch writes atomically (tmp + os.rename), replacing the file's inode on
+--- every write; vim.uv.new_fs_event watching the file path holds the old inode and
+--- typically stops firing after that first rename. Watching the directory survives it.
+---@param pr prreview.PR
+local function start_watch(pr)
+  M._stop_watch()
+  local bp = state.batch_path(pr)
+  local dir = vim.fn.fnamemodify(bp, ":h")
+  local base = vim.fn.fnamemodify(bp, ":t")
+  local handle = vim.uv.new_fs_event()
+  if not handle then
+    return
+  end
+  local pending = false
+  handle:start(dir, {}, function(_, filename)
+    if filename and filename ~= base then
+      return
+    end
+    if pending then
+      return
+    end
+    pending = true
+    -- Debounce: peer-review's own edits can fire multiple dir events in quick
+    -- succession; coalesce them into one re-render ~200ms after the first of a burst.
+    vim.defer_fn(function()
+      pending = false
+      if current_pr then
+        overlay.refresh(current_pr)
+      end
+    end, 200)
+  end)
+  M._watch = handle
+end
 
 ---@param arg string  PR URL, or a bare number when inside the repo.
 ---@return prreview.PR?
@@ -135,6 +184,38 @@ function M.start(arg)
   end
   diff.open(pr.base)
   overlay.refresh(pr)
+  -- Watch the batch file: when Claude (peer-review) flips draft→verified and writes it
+  -- back, re-render so the flip shows without the human doing anything.
+  start_watch(pr)
+
+  -- Debounced nudge: after staging drafts, poke the claude pane (if present) to verify them.
+  local nudger = nudge.make({
+    delay_ms = 1500,
+    msg = ("prreview: new draft suggestion(s) in %s — verify and flip to verified"):format(state.batch_path(pr)),
+    count_drafts = function()
+      -- If the review was closed or switched, a pending deferred nudge must no-op
+      -- (current_pr is cleared by :PrReviewClose / replaced by another :PrReviewStart).
+      if current_pr ~= pr then
+        return 0
+      end
+      return batch.count_drafts(state.load_or_init_batch(pr))
+    end,
+    find_pane = function()
+      local sess = ("ai-rev-pr%d"):format(pr.number)
+      -- pcall: gh.run/vim.system THROWS (ENOENT) when tmux isn't installed — not a nonzero code.
+      local ok, r = pcall(gh.run, { "tmux", "list-panes", "-t", sess, "-F", "#{pane_id} #{pane_current_command}" })
+      if not ok or r.code ~= 0 then
+        return nil -- no tmux / no such session → silent no-op
+      end
+      return nudge.pick_pane(r.stdout)
+    end,
+    send = function(cmd)
+      pcall(gh.run, cmd) -- best-effort; a send-keys failure must never surface
+    end,
+    schedule = function(ms, fn)
+      vim.defer_fn(fn, ms)
+    end,
+  })
 
   local diffparse = require("ai-review.diffparse")
   -- Assumes one active review at a time, like PipPrReviewOverlay below: this augroup's
@@ -184,6 +265,9 @@ function M.start(arg)
       state.save_batch(b)
       overlay.refresh(current_pr)
       vim.notify(("prreview: staged %d draft suggestion(s) for %s"):format(#entries, rel))
+      if #entries > 0 then
+        nudger.request()
+      end
     end,
   })
 
@@ -296,6 +380,7 @@ function M.setup(opts)
       gh.run(gh.worktree_remove_cmd(wt))
       gh.run(gh.worktree_prune_cmd())
     end
+    M._stop_watch()
     pcall(vim.fn.delete, state.active_path()) -- clear active.json
     overlay.clear()
     current_pr = nil
@@ -319,6 +404,9 @@ function M.setup(opts)
       end
     end,
   })
+  -- `clear = true` above already makes re-running setup() idempotent for the group;
+  -- put the watcher teardown in it too so this doesn't stack duplicate autocmds.
+  vim.api.nvim_create_autocmd("VimLeavePre", { group = augroup, callback = M._stop_watch })
 end
 
 return M
