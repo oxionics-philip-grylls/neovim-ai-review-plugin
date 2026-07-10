@@ -1,0 +1,51 @@
+---
+# selene standard-library extension: Neovim `vim` global + busted test globals.
+globals:
+  vim:
+    any: true
+  describe:
+    args:
+      - type: string
+      - type: function
+  it:
+    args:
+      - type: string
+      - type: function
+  before_each:
+    args:
+      - type: function
+  after_each:
+    args:
+      - type: function
+  pending:
+    args:
+      - required: false
+        type: string
+  # luassert (busted) surface used by the specs.
+  assert.are.equal:
+    args:
+      - type: any
+      - type: any
+  assert.are.same:
+    args:
+      - type: any
+      - type: any
+  assert.is_true:
+    args:
+      - type: any
+      - required: false
+        type: string
+  assert.is_truthy:
+    args:
+      - type: any
+  assert.is_string:
+    args:
+      - type: any
+      - required: false
+        type: string
+  assert.is_not_nil:
+    args:
+      - type: any
+  assert.is_nil:
+    args:
+      - type: any
