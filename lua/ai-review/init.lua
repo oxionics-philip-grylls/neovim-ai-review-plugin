@@ -13,6 +13,9 @@ local M = {}
 local current_pr = nil
 ---@type uv.uv_fs_event_t?
 M._watch = nil
+-- Snacks explorer picker opened on the RIGHT during a review (diffview's diff panel
+-- holds the left). Captured so we close exactly this one on :PrReviewClose.
+M._review_tree = nil
 
 --- Stop the batch fs-watcher (idempotent).
 function M._stop_watch()
@@ -23,6 +26,35 @@ function M._stop_watch()
     end)
     M._watch = nil
   end
+end
+
+--- Close the review's right-side file tree, if we opened one (idempotent).
+function M._close_review_tree()
+  if M._review_tree then
+    pcall(function()
+      M._review_tree:close()
+    end)
+    M._review_tree = nil
+  end
+end
+
+--- Open a normal file tree on the RIGHT for the review, alongside diffview's diff panel.
+--- No-op when snacks isn't installed (e.g. headless tests), so it never breaks a review.
+local function open_review_tree()
+  local ok, snacks = pcall(require, "snacks")
+  if not ok then
+    return
+  end
+  pcall(function()
+    -- Snacks keeps ONE explorer per source: calling explorer() while one is already
+    -- open toggles it SHUT. So if the user already has their normal <leader>e explorer
+    -- open, leave it be — bail rather than hijack/close it (we just skip the right tree
+    -- this review). We only ever open + close OUR own tree.
+    if #(snacks.picker.get({ source = "explorer" }) or {}) > 0 then
+      return
+    end
+    M._review_tree = snacks.explorer({ layout = { layout = { position = "right" } } })
+  end)
 end
 
 --- Watch the batch's PARENT DIRECTORY (not the file itself), filtered to its basename.
@@ -203,6 +235,7 @@ function M.start(arg)
     state.save_batch(batch.new(pr))
   end
   diff.open(pr.base)
+  open_review_tree() -- normal file tree on the right, beside the diff panel
   overlay.refresh(pr)
   -- Watch the batch file: when Claude (peer-review) flips draft→verified and writes it
   -- back, re-render so the flip shows without the human doing anything.
@@ -686,6 +719,7 @@ function M.setup(opts)
       gh.run({ "git", "branch", "-D", ("review/pr-%d-suggestions"):format(number) })
     end
     M._stop_watch()
+    M._close_review_tree()
     pcall(vim.fn.delete, state.active_path()) -- clear active.json
     overlay.clear()
     current_pr = nil
@@ -711,7 +745,13 @@ function M.setup(opts)
   })
   -- `clear = true` above already makes re-running setup() idempotent for the group;
   -- put the watcher teardown in it too so this doesn't stack duplicate autocmds.
-  vim.api.nvim_create_autocmd("VimLeavePre", { group = augroup, callback = M._stop_watch })
+  vim.api.nvim_create_autocmd("VimLeavePre", {
+    group = augroup,
+    callback = function()
+      M._stop_watch()
+      M._close_review_tree()
+    end,
+  })
 end
 
 return M
