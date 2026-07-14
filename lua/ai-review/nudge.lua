@@ -27,6 +27,17 @@ function M.nudge_cmd(pane_id, msg)
   return { "tmux", "send-keys", "-t", pane_id, msg, "Enter" }
 end
 
+--- The message to send to the claude pane when the user asks Claude to author the
+--- review summary body. `batch_path` tells the /peer-review skill which batch to edit.
+---@param batch_path string
+---@return string
+function M.body_request_msg(batch_path)
+  return (
+    "prreview: please author the review summary body (overall assessment + reasoning) "
+    .. "into the batch's `body` field at %s, then tell me it's ready"
+  ):format(batch_path)
+end
+
 --- Build a debounced nudger. `request()` arms a single trailing timer; further requests
 --- while armed are no-ops (coalescing). On fire: nudge only if there are drafts and a pane.
 ---@param opts { delay_ms: integer, msg: string, count_drafts: fun():integer, find_pane: fun():string?, send: fun(cmd:string[]), schedule: fun(ms:integer, fn:fun()) }

@@ -35,6 +35,11 @@ globals:
       - type: any
       - required: false
         type: string
+  assert.is_false:
+    args:
+      - type: any
+      - required: false
+        type: string
   assert.is_truthy:
     args:
       - type: any

@@ -117,6 +117,17 @@ local function resolve_pr(arg)
   return { owner = ref.owner, repo = ref.repo, number = ref.number, base = info.base, head_sha = info.head_sha }
 end
 
+-- Locate the claude pane in this PR's tmux session (ai-rev-pr<n>), or nil.
+-- pcall: tmux may be absent (vim.system throws ENOENT, not a nonzero code).
+local function find_claude_pane(pr)
+  local sess = ("ai-rev-pr%d"):format(pr.number)
+  local ok, r = pcall(gh.run, { "tmux", "list-panes", "-t", sess, "-F", "#{pane_id} #{pane_current_command}" })
+  if not ok or r.code ~= 0 then
+    return nil
+  end
+  return nudge.pick_pane(r.stdout)
+end
+
 --- Create the review worktree at `wt` on branch review/pr-<n>-suggestions checked
 --- out at pr.head_sha, retrying once behind a prune (add refuses a stale admin
 --- entry that prune clears). Notifies and returns false on hard failure.
@@ -210,13 +221,7 @@ function M.start(arg)
       return batch.count_drafts(state.load_or_init_batch(pr))
     end,
     find_pane = function()
-      local sess = ("ai-rev-pr%d"):format(pr.number)
-      -- pcall: gh.run/vim.system THROWS (ENOENT) when tmux isn't installed — not a nonzero code.
-      local ok, r = pcall(gh.run, { "tmux", "list-panes", "-t", sess, "-F", "#{pane_id} #{pane_current_command}" })
-      if not ok or r.code ~= 0 then
-        return nil -- no tmux / no such session → silent no-op
-      end
-      return nudge.pick_pane(r.stdout)
+      return find_claude_pane(pr)
     end,
     send = function(cmd)
       pcall(gh.run, cmd) -- best-effort; a send-keys failure must never surface
@@ -406,6 +411,58 @@ function M.suggest()
   end
 end
 
+--- Open (or reveal) the review-body scratch buffer for the current PR. A markdown
+--- acwrite buffer: :w routes through the batch via BufWriteCmd, nothing hits disk.
+--- Prefilled from batch.body on a fresh create so the body builds up across opens.
+function M.body()
+  if not current_pr then
+    vim.notify("prreview: no active review (:PrReviewStart)", vim.log.levels.ERROR)
+    return
+  end
+  local pr = current_pr -- snapshot: the BufWriteCmd must target THIS review's batch,
+  -- not whatever review happens to be active when a later :w fires.
+  local name = ("prreview://body/%s__%s__pr%d"):format(pr.owner, pr.repo, pr.number)
+
+  local existing = vim.fn.bufnr(name)
+  if existing ~= -1 and vim.api.nvim_buf_is_loaded(existing) then
+    -- reveal the live buffer as-is: preserves unsaved edits, no re-prefill
+    vim.cmd("sbuffer " .. existing)
+    return
+  end
+
+  local bufnr = existing ~= -1 and existing or vim.api.nvim_create_buf(true, false)
+  if existing == -1 then
+    vim.api.nvim_buf_set_name(bufnr, name)
+  end
+  vim.bo[bufnr].buftype = "acwrite"
+  vim.bo[bufnr].filetype = "markdown"
+  local body = state.load_or_init_batch(pr).body or ""
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, vim.split(body, "\n", { plain = true }))
+  vim.bo[bufnr].modified = false
+
+  -- clear before attach: reusing an unloaded bufnr with this name would otherwise
+  -- stack a second BufWriteCmd, firing the save (and its notify) once per reuse cycle
+  vim.api.nvim_clear_autocmds({ event = "BufWriteCmd", buffer = bufnr })
+  vim.api.nvim_create_autocmd("BufWriteCmd", {
+    buffer = bufnr,
+    callback = function()
+      if current_pr ~= pr then
+        vim.notify("prreview: body buffer is for a review that's no longer active", vim.log.levels.WARN)
+        return
+      end
+      local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+      local b = state.load_or_init_batch(pr)
+      b.body = table.concat(lines, "\n")
+      state.save_batch(b)
+      overlay.refresh(pr)
+      vim.bo[bufnr].modified = false
+      vim.notify("prreview: body saved")
+    end,
+  })
+
+  vim.cmd("sbuffer " .. bufnr)
+end
+
 --- Extract a numeric review id from a `gh api ... reviews` POST response, if parseable.
 ---@param stdout string
 ---@return integer?
@@ -456,41 +513,69 @@ function M.submit()
       vim.log.levels.WARN
     )
   end
-  vim.ui.select({ "COMMENT", "REQUEST_CHANGES", "APPROVE" }, { prompt = "Verdict:" }, function(verdict)
-    if not verdict then
-      return
-    end
-    -- re-read here (not the `b` captured above): a verify-flip landing while this
-    -- picker was open must be included, not silently dropped from the post
-    b = state.load_or_init_batch(current_pr)
-    -- Only bail on a submitted_at that APPEARED while the picker was open (a concurrent
-    -- submit) — not on the one the user already confirmed past at the top of M.submit,
-    -- else the "Submit again?" Yes branch would be unreachable.
-    if b.submitted_at and b.submitted_at ~= prior_submitted_at then
-      vim.notify("prreview: submit cancelled (already submitted at " .. b.submitted_at .. ")", vim.log.levels.WARN)
-      return
-    end
-    b.verdict = verdict
-    local serialized = batch.serialize(b)
-    if #serialized.comments == 0 and (not serialized.body or serialized.body == "") then
-      vim.notify("prreview: nothing to submit", vim.log.levels.WARN)
-      return
-    end
-    local tmp = vim.fn.tempname()
-    local fd = assert(io.open(tmp, "w"))
-    fd:write(vim.json.encode(serialized))
-    fd:close()
-    local r = gh.run(gh.post_review_cmd(current_pr.owner, current_pr.repo, current_pr.number, tmp))
-    if r.code == 0 then
-      b.submitted_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
-      b.submitted_review = parse_review_id(r.stdout)
-      state.save_batch(b)
-      vim.notify("prreview: review posted")
-    else
-      vim.notify("prreview: post failed: " .. r.stderr, vim.log.levels.ERROR)
-    end
-    vim.fn.delete(tmp) -- review JSON can carry code snippets; don't leave it in tmp
-  end)
+  local function do_verdict()
+    vim.ui.select({ "COMMENT", "REQUEST_CHANGES", "APPROVE" }, { prompt = "Verdict:" }, function(verdict)
+      if not verdict then
+        return
+      end
+      -- re-read here (not the `b` captured above): a verify-flip landing while this
+      -- picker was open must be included, not silently dropped from the post
+      b = state.load_or_init_batch(current_pr)
+      -- Only bail on a submitted_at that APPEARED while the picker was open (a concurrent
+      -- submit) — not on the one the user already confirmed past at the top of M.submit.
+      if b.submitted_at and b.submitted_at ~= prior_submitted_at then
+        vim.notify("prreview: submit cancelled (already submitted at " .. b.submitted_at .. ")", vim.log.levels.WARN)
+        return
+      end
+      b.verdict = verdict
+      local serialized = batch.serialize(b)
+      if #serialized.comments == 0 and (not serialized.body or serialized.body == "") then
+        vim.notify("prreview: nothing to submit", vim.log.levels.WARN)
+        return
+      end
+      local tmp = vim.fn.tempname()
+      local fd = assert(io.open(tmp, "w"))
+      fd:write(vim.json.encode(serialized))
+      fd:close()
+      local r = gh.run(gh.post_review_cmd(current_pr.owner, current_pr.repo, current_pr.number, tmp))
+      if r.code == 0 then
+        b.submitted_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
+        b.submitted_review = parse_review_id(r.stdout)
+        state.save_batch(b)
+        vim.notify("prreview: review posted")
+      else
+        vim.notify("prreview: post failed: " .. r.stderr, vim.log.levels.ERROR)
+      end
+      vim.fn.delete(tmp) -- review JSON can carry code snippets; don't leave it in tmp
+    end)
+  end
+
+  -- Empty summary body: don't silently post one. Offer to write it, delegate it to
+  -- Claude, or knowingly proceed. Checked against the fresh `b` loaded at submit start.
+  if (b.body or ""):match("^%s*$") then
+    vim.ui.select(
+      { "Write it now", "Let Claude write it", "Submit without a body", "Cancel" },
+      { prompt = "Empty review body:" },
+      function(choice)
+        if choice == "Write it now" then
+          M.body()
+        elseif choice == "Let Claude write it" then
+          local pane = find_claude_pane(current_pr)
+          if pane then
+            pcall(gh.run, nudge.nudge_cmd(pane, nudge.body_request_msg(state.batch_path(current_pr))))
+            vim.notify("prreview: asked Claude to write the body — re-run :PrReviewSubmit when it's done")
+          else
+            vim.notify("prreview: no claude pane found — write the body with :PrBody", vim.log.levels.WARN)
+          end
+        elseif choice == "Submit without a body" then
+          do_verdict()
+        end
+        -- "Cancel"/nil: nothing
+      end
+    )
+  else
+    do_verdict()
+  end
 end
 
 ---@param opts? table
@@ -507,6 +592,7 @@ function M.setup(opts)
     add_comment("comment", range)
   end, { range = true })
   vim.api.nvim_create_user_command("PrSuggest", M.suggest, { range = true })
+  vim.api.nvim_create_user_command("PrBody", M.body, {})
   vim.api.nvim_create_user_command("PrReviewRefresh", function()
     if current_pr then
       overlay.refresh(current_pr)

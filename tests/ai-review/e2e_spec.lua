@@ -636,8 +636,12 @@ describe("ai-review end-to-end", function()
       end
       return real_run(cmd)
     end
-    vim.ui.select = function(_, _, cb)
-      cb("COMMENT")
+    vim.ui.select = function(_, opts, cb)
+      if opts.prompt == "Empty review body:" then
+        cb("Submit without a body")
+      else
+        cb("COMMENT")
+      end
     end
     vim.fn.confirm = function()
       return 2
@@ -673,8 +677,12 @@ describe("ai-review end-to-end", function()
       end
       return real_run(cmd)
     end
-    vim.ui.select = function(_, _, cb)
-      cb("COMMENT")
+    vim.ui.select = function(_, opts, cb)
+      if opts.prompt == "Empty review body:" then
+        cb("Submit without a body")
+      else
+        cb("COMMENT")
+      end
     end
     vim.fn.confirm = function()
       return 1
@@ -683,6 +691,201 @@ describe("ai-review end-to-end", function()
     assert.are.equal(1, posts)
     pr.submit() -- confirmed re-submit: the already-confirmed submitted_at must NOT block it
     assert.are.equal(2, posts)
+    close_diffview_and_wait()
+  end)
+
+  it("PrBody writes the batch body and prefills it on reopen", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    local prkey = { owner = "test", repo = "repo", number = 1 }
+
+    vim.cmd("PrBody")
+    -- :PrBody focuses the body buffer in a new split
+    assert.are.equal("prreview://body/test__repo__pr1", vim.api.nvim_buf_get_name(0))
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, { "Overall solid.", "", "One concern about pull_policy." })
+    vim.cmd("write") -- BufWriteCmd, not a disk write
+    assert.is_false(vim.bo.modified)
+
+    local b = state.load_or_init_batch(prkey)
+    assert.are.equal("Overall solid.\n\nOne concern about pull_policy.", b.body)
+
+    -- wipe the buffer, reopen: prefilled from the saved body
+    vim.cmd("bwipeout!")
+    vim.cmd("PrBody")
+    assert.are.same(
+      { "Overall solid.", "", "One concern about pull_policy." },
+      vim.api.nvim_buf_get_lines(0, 0, -1, false)
+    )
+    vim.cmd("bwipeout!")
+    close_diffview_and_wait()
+  end)
+
+  it("PrBody reveals a live body buffer as-is, without re-prefilling", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    vim.cmd("PrBody")
+    local body_buf = vim.api.nvim_get_current_buf()
+    -- unsaved working edits; the batch body on disk is still ""
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, { "half-written thought" })
+    vim.cmd("wincmd p") -- leave the body window; buffer stays loaded (hidden)
+
+    vim.cmd("PrBody") -- reveal, not recreate
+    assert.are.equal(body_buf, vim.api.nvim_get_current_buf())
+    assert.are.same({ "half-written thought" }, vim.api.nvim_buf_get_lines(0, 0, -1, false))
+    vim.cmd("bwipeout!")
+    close_diffview_and_wait()
+  end)
+
+  it("submit prompts on an empty body and 'Submit without a body' posts", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    local prkey = { owner = "test", repo = "repo", number = 1 }
+    local b = state.load_or_init_batch(prkey)
+    batch.add(b, {
+      path = "file.txt",
+      side = "RIGHT",
+      line = 2,
+      kind = "comment",
+      origin = "human",
+      status = "verified",
+      body = "note",
+    })
+    state.save_batch(b) -- body stays ""
+
+    local posts = 0
+    local real_run = gh.run
+    gh.run = function(cmd)
+      if cmd[1] == "gh" and cmd[2] == "api" then
+        posts = posts + 1
+        return { code = 0, stdout = "{}", stderr = "" }
+      end
+      return real_run(cmd)
+    end
+    -- first select = the empty-body prompt; second = the verdict
+    local prompts = {}
+    vim.ui.select = function(_, opts, cb)
+      prompts[#prompts + 1] = opts.prompt
+      if opts.prompt == "Empty review body:" then
+        cb("Submit without a body")
+      else
+        cb("COMMENT")
+      end
+    end
+    pr.submit()
+    assert.are.equal(1, posts)
+    assert.are.equal("Empty review body:", prompts[1])
+    assert.are.equal("Verdict:", prompts[2])
+    close_diffview_and_wait()
+  end)
+
+  it("submit 'Cancel' on an empty body posts nothing", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    local prkey = { owner = "test", repo = "repo", number = 1 }
+    local b = state.load_or_init_batch(prkey)
+    batch.add(b, {
+      path = "file.txt",
+      side = "RIGHT",
+      line = 2,
+      kind = "comment",
+      origin = "human",
+      status = "verified",
+      body = "note",
+    })
+    state.save_batch(b)
+    local posts = 0
+    local real_run = gh.run
+    gh.run = function(cmd)
+      if cmd[1] == "gh" and cmd[2] == "api" then
+        posts = posts + 1
+        return { code = 0, stdout = "{}", stderr = "" }
+      end
+      return real_run(cmd)
+    end
+    vim.ui.select = function(_, opts, cb)
+      if opts.prompt == "Empty review body:" then
+        cb("Cancel")
+      else
+        cb("COMMENT")
+      end
+    end
+    pr.submit()
+    assert.are.equal(0, posts)
+    close_diffview_and_wait()
+  end)
+
+  it("submit skips the empty-body prompt when the body is set", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    local prkey = { owner = "test", repo = "repo", number = 1 }
+    local b = state.load_or_init_batch(prkey)
+    b.body = "Looks good overall."
+    batch.add(b, {
+      path = "file.txt",
+      side = "RIGHT",
+      line = 2,
+      kind = "comment",
+      origin = "human",
+      status = "verified",
+      body = "note",
+    })
+    state.save_batch(b)
+    local posts = 0
+    local real_run = gh.run
+    gh.run = function(cmd)
+      if cmd[1] == "gh" and cmd[2] == "api" then
+        posts = posts + 1
+        return { code = 0, stdout = "{}", stderr = "" }
+      end
+      return real_run(cmd)
+    end
+    local first_prompt
+    vim.ui.select = function(_, opts, cb)
+      first_prompt = first_prompt or opts.prompt
+      cb("COMMENT")
+    end
+    pr.submit()
+    assert.are.equal("Verdict:", first_prompt) -- went straight to the verdict, no empty-body prompt
+    assert.are.equal(1, posts)
+    close_diffview_and_wait()
+  end)
+
+  it("submit 'Let Claude write it' nudges the pane and posts nothing", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    local prkey = { owner = "test", repo = "repo", number = 1 }
+    local b = state.load_or_init_batch(prkey)
+    batch.add(b, {
+      path = "file.txt",
+      side = "RIGHT",
+      line = 2,
+      kind = "comment",
+      origin = "human",
+      status = "verified",
+      body = "note",
+    })
+    state.save_batch(b)
+    local posts, sent = 0, nil
+    local real_run = gh.run
+    gh.run = function(cmd)
+      if cmd[1] == "gh" and cmd[2] == "api" then
+        posts = posts + 1
+        return { code = 0, stdout = "{}", stderr = "" }
+      end
+      if cmd[1] == "tmux" and cmd[2] == "list-panes" then
+        return { code = 0, stdout = "%1 nvim\n%2 claude\n", stderr = "" }
+      end
+      if cmd[1] == "tmux" and cmd[2] == "send-keys" then
+        sent = cmd
+        return { code = 0, stdout = "", stderr = "" }
+      end
+      return real_run(cmd)
+    end
+    vim.ui.select = function(_, opts, cb)
+      if opts.prompt == "Empty review body:" then
+        cb("Let Claude write it")
+      else
+        cb("COMMENT")
+      end
+    end
+    pr.submit()
+    assert.are.equal(0, posts)
+    assert.is_not_nil(sent) -- a send-keys nudge fired at the claude pane
+    assert.are.equal("%2", sent[4])
     close_diffview_and_wait()
   end)
 end)
