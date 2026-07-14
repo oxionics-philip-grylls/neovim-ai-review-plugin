@@ -32,6 +32,7 @@ local M = {}
 ---@field body string
 ---@field comments prreview.Comment[]
 ---@field next_id integer monotonic id counter; persisted so ids never reuse across saves
+---@field reviewed string[] repo-relative paths marked reviewed (local-only; never serialized)
 ---@field submitted_at? string
 ---@field submitted_review? integer
 ---@field _loaded_mtime? { sec: integer, nsec: integer } generation stamp; not persisted
@@ -39,7 +40,7 @@ local M = {}
 ---@param pr prreview.PR
 ---@return prreview.Batch
 function M.new(pr)
-  return { pr = pr, verdict = nil, body = "", comments = {}, next_id = 1 }
+  return { pr = pr, verdict = nil, body = "", comments = {}, next_id = 1, reviewed = {} }
 end
 
 ---@param b prreview.Batch
@@ -77,6 +78,40 @@ function M.count_drafts(b)
 end
 
 ---@param b prreview.Batch
+---@param path string
+---@return boolean
+function M.is_reviewed(b, path)
+  for _, p in ipairs(b.reviewed or {}) do
+    if p == path then
+      return true
+    end
+  end
+  return false
+end
+
+--- Toggle a path's reviewed membership. Returns the NEW state (true = now reviewed).
+---@param b prreview.Batch
+---@param path string
+---@return boolean
+function M.toggle_reviewed(b, path)
+  b.reviewed = b.reviewed or {}
+  for i, p in ipairs(b.reviewed) do
+    if p == path then
+      table.remove(b.reviewed, i)
+      return false
+    end
+  end
+  b.reviewed[#b.reviewed + 1] = path
+  return true
+end
+
+---@param b prreview.Batch
+---@return integer
+function M.count_reviewed(b)
+  return #(b.reviewed or {})
+end
+
+---@param b prreview.Batch
 ---@return string
 function M.encode(b)
   local persisted = {}
@@ -110,6 +145,11 @@ end
 ---@param decoded table
 ---@return prreview.Batch
 function M.validate(decoded)
+  -- coerce reviewed FIRST, before any early return: a doubly-corrupt file (bad comments
+  -- AND bad reviewed) must still leave a list-shaped reviewed, else later ipairs() throws.
+  if type(decoded.reviewed) ~= "table" then
+    decoded.reviewed = {}
+  end
   if type(decoded.comments) ~= "table" then
     decoded.comments = {}
     return decoded

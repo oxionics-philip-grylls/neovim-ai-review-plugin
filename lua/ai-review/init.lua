@@ -7,6 +7,7 @@ local gh = require("ai-review.gh")
 local diff = require("ai-review.diff")
 local overlay = require("ai-review.overlay")
 local nudge = require("ai-review.nudge")
+local panel = require("ai-review.panel")
 
 local M = {}
 ---@type prreview.PR?
@@ -149,6 +150,22 @@ local function resolve_pr(arg)
   return { owner = ref.owner, repo = ref.repo, number = ref.number, base = info.base, head_sha = info.head_sha }
 end
 
+--- Number of files the PR touches (origin/<base>...<head_sha>), or nil if git fails.
+--- Used for the "N/M reviewed" count and the submit warning; independent of diffview.
+---@param pr prreview.PR
+---@return integer?
+local function changed_file_count(pr)
+  local r = gh.run({ "git", "diff", "--name-only", ("origin/%s...%s"):format(pr.base, pr.head_sha) })
+  if r.code ~= 0 then
+    return nil
+  end
+  local n = 0
+  for _ in r.stdout:gmatch("[^\n]+") do
+    n = n + 1
+  end
+  return n
+end
+
 -- Locate the claude pane in this PR's tmux session (ai-rev-pr<n>), or nil.
 -- pcall: tmux may be absent (vim.system throws ENOENT, not a nonzero code).
 local function find_claude_pane(pr)
@@ -227,6 +244,10 @@ function M.start(arg)
         vim.log.levels.WARN
       )
       gh.run({ "git", "-C", wt, "reset", "--hard", pr.head_sha })
+      local moved = state.load_or_init_batch(pr)
+      moved.reviewed = {}
+      state.save_batch(moved)
+      vim.notify("prreview: PR moved — reviewed marks cleared", vim.log.levels.WARN)
     end
   end
   current_pr = pr
@@ -281,6 +302,7 @@ function M.start(arg)
       -- fires for whichever diff buffer is entered (both sides); the RIGHT-only guard lives in M.suggest
       vim.keymap.set("n", "i", "<cmd>PrSuggest<cr>", { buffer = 0, desc = "PR: edit on branch to suggest" })
       vim.keymap.set("n", "<leader>re", "<cmd>PrSuggest<cr>", { buffer = 0, desc = "PR: edit on branch to suggest" })
+      vim.keymap.set("n", "R", "<cmd>PrReviewed<cr>", { buffer = 0, desc = "PR: toggle file reviewed" })
     end,
   })
   vim.api.nvim_create_autocmd("BufWritePost", {
@@ -561,6 +583,31 @@ function M.comments()
   end)
 end
 
+--- Toggle the current diffview file's reviewed mark, persist it, and re-mark the panel.
+function M.toggle_reviewed()
+  if not current_pr then
+    vim.notify("prreview: no active review (:PrReviewStart)", vim.log.levels.ERROR)
+    return
+  end
+  local ok, lib = pcall(require, "diffview.lib")
+  local view = ok and lib.get_current_view() or nil
+  local path = view and view.cur_entry and view.cur_entry.path
+  if not path then
+    vim.notify("prreview: no file under the cursor to mark", vim.log.levels.WARN)
+    return
+  end
+  local b = state.load_or_init_batch(current_pr)
+  batch.toggle_reviewed(b, path)
+  state.save_batch(b)
+  panel.refresh(current_pr)
+  local m = changed_file_count(current_pr)
+  if m then
+    vim.notify(("prreview: reviewed %d/%d files"):format(batch.count_reviewed(b), m))
+  else
+    vim.notify(("prreview: reviewed %d files"):format(batch.count_reviewed(b)))
+  end
+end
+
 --- Extract a numeric review id from a `gh api ... reviews` POST response, if parseable.
 ---@param stdout string
 ---@return integer?
@@ -610,6 +657,13 @@ function M.submit()
       ("prreview: %d unverified draft(s) will be skipped — ask Claude to verify first"):format(drafts),
       vim.log.levels.WARN
     )
+  end
+  local total = changed_file_count(current_pr)
+  if total and total > 0 then
+    local unreviewed = total - batch.count_reviewed(b)
+    if unreviewed > 0 then
+      vim.notify(("prreview: %d of %d files not marked reviewed"):format(unreviewed, total), vim.log.levels.WARN)
+    end
   end
   local function do_verdict()
     vim.ui.select({ "COMMENT", "REQUEST_CHANGES", "APPROVE" }, { prompt = "Verdict:" }, function(verdict)
@@ -692,6 +746,7 @@ function M.setup(opts)
   vim.api.nvim_create_user_command("PrSuggest", M.suggest, { range = true })
   vim.api.nvim_create_user_command("PrBody", M.body, {})
   vim.api.nvim_create_user_command("PrComments", M.comments, {})
+  vim.api.nvim_create_user_command("PrReviewed", M.toggle_reviewed, {})
   vim.api.nvim_create_user_command("PrReviewRefresh", function()
     if current_pr then
       overlay.refresh(current_pr)
@@ -720,6 +775,7 @@ function M.setup(opts)
     end
     M._stop_watch()
     M._close_review_tree()
+    panel.detach()
     pcall(vim.fn.delete, state.active_path()) -- clear active.json
     overlay.clear()
     current_pr = nil
@@ -743,6 +799,22 @@ function M.setup(opts)
       end
     end,
   })
+  vim.api.nvim_create_autocmd("User", {
+    group = augroup,
+    pattern = "DiffviewViewOpened",
+    callback = function()
+      if current_pr then
+        panel.attach(current_pr)
+      end
+    end,
+  })
+  vim.api.nvim_create_autocmd("User", {
+    group = augroup,
+    pattern = "DiffviewViewClosed",
+    callback = function()
+      panel.detach()
+    end,
+  })
   -- `clear = true` above already makes re-running setup() idempotent for the group;
   -- put the watcher teardown in it too so this doesn't stack duplicate autocmds.
   vim.api.nvim_create_autocmd("VimLeavePre", {
@@ -750,6 +822,7 @@ function M.setup(opts)
     callback = function()
       M._stop_watch()
       M._close_review_tree()
+      panel.detach()
     end,
   })
 end

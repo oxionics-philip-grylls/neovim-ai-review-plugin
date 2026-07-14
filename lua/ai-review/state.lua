@@ -122,6 +122,7 @@ local function merge_batches(d, b)
     body = b.body,
     comments = comments,
     next_id = math.max(d.next_id or 0, b.next_id or 0),
+    reviewed = b.reviewed or d.reviewed or {},
     -- the double-post guard marker must never be dropped by a merge
     submitted_at = b.submitted_at or d.submitted_at,
     submitted_review = b.submitted_review or d.submitted_review,

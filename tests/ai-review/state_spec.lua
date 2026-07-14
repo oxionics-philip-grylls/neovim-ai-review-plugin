@@ -184,4 +184,34 @@ describe("ai-review.state", function()
     assert.are.equal("mine", final.comments[1].body)
     vim.fn.delete(root, "rf")
   end)
+
+  it("keeps this writer's reviewed set through a generation-checked merge", function()
+    local root = vim.fn.tempname()
+    local b = state.load_or_init_batch(pr, root)
+    batch.toggle_reviewed(b, "mine.rs")
+    state.save_batch(b, root)
+    -- a concurrent writer lands a comment (never touches reviewed)
+    local path = state.batch_path(pr, root)
+    local fd = assert(io.open(path, "r"))
+    local disk = batch.decode(fd:read("*a"))
+    fd:close()
+    disk.comments[#disk.comments + 1] = {
+      id = "cX",
+      path = "x",
+      side = "RIGHT",
+      line = 1,
+      kind = "comment",
+      origin = "claude",
+      status = "verified",
+      body = "c",
+    }
+    local wfd = assert(io.open(path, "w"))
+    wfd:write(batch.encode(disk))
+    wfd:close()
+    b._loaded_mtime = { sec = 0, nsec = 0 } -- force the merge path
+    state.save_batch(b, root)
+    local final = state.load_or_init_batch(pr, root)
+    assert.are.same({ "mine.rs" }, final.reviewed) -- our reviewed survived the merge
+    vim.fn.delete(root, "rf")
+  end)
 end)

@@ -944,4 +944,98 @@ describe("ai-review end-to-end", function()
     assert.is_false(opened) -- select never called
     close_diffview_and_wait()
   end)
+
+  it("PrReviewed toggles the current file and persists it", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    local prkey = { owner = "test", repo = "repo", number = 1 }
+    -- stub the diffview current-file lookup used by M.toggle_reviewed
+    local diffview = require("diffview.lib")
+    local orig = diffview.get_current_view
+    diffview.get_current_view = function()
+      return { cur_entry = { path = "file.txt" } }
+    end
+
+    vim.cmd("PrReviewed")
+    assert.is_true(batch.is_reviewed(state.load_or_init_batch(prkey), "file.txt"))
+    vim.cmd("PrReviewed") -- toggle off
+    assert.is_false(batch.is_reviewed(state.load_or_init_batch(prkey), "file.txt"))
+
+    diffview.get_current_view = orig
+    close_diffview_and_wait()
+  end)
+
+  it("clears reviewed marks when the PR head moves on re-start", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    local prkey = { owner = "test", repo = "repo", number = 1 }
+    local b = state.load_or_init_batch(prkey)
+    batch.toggle_reviewed(b, "file.txt")
+    state.save_batch(b)
+    close_diffview_and_wait()
+
+    -- move the PR head: push a new commit to refs/pull/1/head so head_sha changes
+    local seed = root .. "/seed"
+    vim.fn.writefile({ "line1", "CHANGED", "line3", "line4-added", "line5-new" }, seed .. "/file.txt")
+    local function g(a)
+      return sh("git -C " .. seed .. " " .. a)
+    end
+    g("commit -qam prmove")
+    g("push -q origin HEAD:refs/pull/1/head")
+    gh.pr_info = function()
+      return { base = "master", head_sha = sh("git -C " .. seed .. " rev-parse HEAD") }
+    end
+
+    pr.start("https://github.com/test/repo/pull/1") -- head moved → worktree reset → reviewed cleared
+    assert.are.equal(0, batch.count_reviewed(state.load_or_init_batch(prkey)))
+    close_diffview_and_wait()
+  end)
+
+  it("submit warns about unreviewed files (non-blocking)", function()
+    -- The default harness stub sets head_sha = origin/master (== base), so
+    -- `git diff base...head` would be empty and the warning (gated on total>0)
+    -- wouldn't fire. Point head at the REAL PR head (the seed's prchange commit,
+    -- fetched into the clone by pr.start) so the diff touches file.txt (total=1).
+    gh.pr_info = function()
+      return { base = "master", head_sha = sh("git -C " .. root .. "/seed rev-parse HEAD") }
+    end
+    pr.start("https://github.com/test/repo/pull/1")
+    local prkey = { owner = "test", repo = "repo", number = 1 }
+    local b = state.load_or_init_batch(prkey)
+    batch.add(b, {
+      path = "file.txt",
+      side = "RIGHT",
+      line = 2,
+      kind = "comment",
+      origin = "human",
+      status = "verified",
+      body = "note",
+    })
+    b.body = "overall"
+    state.save_batch(b) -- 0 files marked reviewed; the PR touches 1 file (file.txt)
+
+    local warned = false
+    local orig_notify = vim.notify
+    vim.notify = function(msg, level)
+      if type(msg) == "string" and msg:find("not marked reviewed", 1, true) then
+        warned = true
+      end
+      return orig_notify(msg, level)
+    end
+    local posts = 0
+    local real_run = gh.run
+    gh.run = function(cmd)
+      if cmd[1] == "gh" and cmd[2] == "api" then
+        posts = posts + 1
+        return { code = 0, stdout = "{}", stderr = "" }
+      end
+      return real_run(cmd)
+    end
+    vim.ui.select = function(_, _, cb)
+      cb("COMMENT")
+    end
+    pr.submit()
+    vim.notify = orig_notify
+    assert.is_true(warned) -- warned...
+    assert.are.equal(1, posts) -- ...but did NOT block the post
+    close_diffview_and_wait()
+  end)
 end)

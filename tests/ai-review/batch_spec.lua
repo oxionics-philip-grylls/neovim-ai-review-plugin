@@ -382,3 +382,42 @@ describe("ai-review.batch.add id uniqueness", function()
     end
   end)
 end)
+
+describe("ai-review.batch reviewed", function()
+  local pr = { owner = "o", repo = "r", number = 5, base = "master", head_sha = "abc" }
+
+  it("new batch starts with an empty reviewed list", function()
+    assert.are.same({}, batch.new(pr).reviewed)
+  end)
+
+  it("toggles a path on and off, reporting the new state", function()
+    local b = batch.new(pr)
+    assert.is_true(batch.toggle_reviewed(b, "a.rs")) -- now reviewed
+    assert.is_true(batch.is_reviewed(b, "a.rs"))
+    assert.are.equal(1, batch.count_reviewed(b))
+    assert.is_false(batch.toggle_reviewed(b, "a.rs")) -- toggled back off
+    assert.is_false(batch.is_reviewed(b, "a.rs"))
+    assert.are.equal(0, batch.count_reviewed(b))
+  end)
+
+  it("persists reviewed across encode/decode and EXCLUDES it from serialize", function()
+    local b = batch.new(pr)
+    batch.toggle_reviewed(b, "a.rs")
+    b.verdict = "COMMENT"
+    local rt = batch.decode(batch.encode(b))
+    assert.are.same({ "a.rs" }, rt.reviewed)
+    -- serialize is the GitHub payload: reviewed must not leak into it
+    assert.is_nil(batch.serialize(b).reviewed)
+  end)
+
+  it("validate coerces a non-list reviewed to an empty list", function()
+    local v = batch.validate({ pr = pr, body = "", comments = {}, reviewed = "garbage" })
+    assert.are.same({}, v.reviewed)
+  end)
+
+  it("validate coerces reviewed even when comments is also garbage", function()
+    local v = batch.validate({ pr = pr, body = "", comments = "bad", reviewed = "bad" })
+    assert.are.same({}, v.reviewed)
+    assert.are.same({}, v.comments)
+  end)
+end)
