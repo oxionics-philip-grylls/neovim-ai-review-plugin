@@ -49,3 +49,12 @@ globals:
   assert.is_nil:
     args:
       - type: any
+      - required: false
+        type: string
+  assert.are_not.equal:
+    args:
+      - type: any
+      - type: any
+  assert.has_no.errors:
+    args:
+      - type: any

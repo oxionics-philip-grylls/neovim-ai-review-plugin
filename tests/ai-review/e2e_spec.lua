@@ -464,6 +464,89 @@ describe("ai-review end-to-end", function()
     assert.are.equal("draft", by_line[3].status)
     assert.are.same({ "SUGGESTED line 3" }, by_line[3].suggestion.lines)
   end)
+  it("staging: a pure-insertion save anchors to head_sha's line, not the shifted worktree line", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    local prkey = { owner = "test", repo = "repo", number = 1 }
+    local wt = state.worktree_path(prkey, troot)
+    local f = wt .. "/file.txt"
+    vim.cmd("edit " .. vim.fn.fnameescape(f))
+    -- two pure insertions in ONE save, after head lines 1 and 2 respectively, without
+    -- touching any existing line. After the first insert the worktree's own line 2 is
+    -- "NEW-A" (shifted), not head_sha's "line2" — the anchor content must still come
+    -- from head_sha, so the second draft's suggestion.lines[1] must be "line2".
+    vim.api.nvim_buf_set_lines(0, 1, 1, false, { "NEW-A" }) -- after "line1"
+    vim.api.nvim_buf_set_lines(0, 3, 3, false, { "NEW-B" }) -- after "line2" (pre-shift)
+    assert.are.same({ "line1", "NEW-A", "line2", "NEW-B", "line3" }, vim.api.nvim_buf_get_lines(0, 0, -1, false))
+    vim.cmd("write")
+
+    local b = state.load_or_init_batch(prkey)
+    local drafts = {}
+    for _, c in ipairs(b.comments) do
+      if c.status == "draft" and c.kind == "suggestion" then
+        drafts[#drafts + 1] = c
+      end
+    end
+    assert.are.equal(2, #drafts) -- not "0 draft suggestions" (the old pure-insertion skip)
+    table.sort(drafts, function(a, c)
+      return a.line < c.line
+    end)
+
+    assert.are.equal(1, drafts[1].start_line)
+    assert.are.equal(1, drafts[1].line)
+    assert.are.same({ "line1", "NEW-A" }, drafts[1].suggestion.lines)
+
+    assert.are.equal(2, drafts[2].start_line)
+    assert.are.equal(2, drafts[2].line)
+    -- CRUCIAL: head_sha's line 2 ("line2"), NOT the worktree's now-shifted line 2 ("NEW-A")
+    assert.are.same({ "line2", "NEW-B" }, drafts[2].suggestion.lines)
+  end)
+  it("staging: a pure-insertion at the very top of the file anchors to line 1", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    local prkey = { owner = "test", repo = "repo", number = 1 }
+    local wt = state.worktree_path(prkey, troot)
+    local f = wt .. "/file.txt"
+    vim.cmd("edit " .. vim.fn.fnameescape(f))
+    vim.api.nvim_buf_set_lines(0, 0, 0, false, { "PREPENDED" })
+    vim.cmd("write")
+
+    local b = state.load_or_init_batch(prkey)
+    local drafts = {}
+    for _, c in ipairs(b.comments) do
+      if c.status == "draft" and c.kind == "suggestion" then
+        drafts[#drafts + 1] = c
+      end
+    end
+    assert.are.equal(1, #drafts)
+    assert.are.equal(1, drafts[1].start_line)
+    assert.are.equal(1, drafts[1].line)
+    -- new content precedes head_sha's original first line
+    assert.are.same({ "PREPENDED", "line1" }, drafts[1].suggestion.lines)
+  end)
+  it("staging: an insertion whose head_sha lookup fails is skipped with a WARN, not a crash", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    local prkey = { owner = "test", repo = "repo", number = 1 }
+    local wt = state.worktree_path(prkey, troot)
+    local newf = wt .. "/newfile.txt"
+    vim.fn.writefile({ "a", "b" }, newf)
+    sh("git -C " .. wt .. " add newfile.txt") -- staged, so it diffs as an addition against head_sha
+    local warned = false
+    local orig_notify = vim.notify
+    vim.notify = function(msg, level)
+      if level == vim.log.levels.WARN then
+        warned = true
+      end
+      orig_notify(msg, level)
+    end
+    vim.cmd("edit " .. vim.fn.fnameescape(newf))
+    vim.cmd("write")
+    vim.notify = orig_notify
+
+    assert.is_true(warned, "expected a WARN when head_sha:newfile.txt can't be read")
+    local b = state.load_or_init_batch(prkey)
+    for _, c in ipairs(b.comments) do
+      assert.are_not.equal("newfile.txt", c.path) -- no bogus draft staged against a nonexistent anchor
+    end
+  end)
   it("resets a stale worktree to the current head on re-start", function()
     pr.start("https://github.com/test/repo/pull/1")
     local wt = state.worktree_path({ owner = "test", repo = "repo", number = 1 }, troot)

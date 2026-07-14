@@ -261,6 +261,24 @@ function M.start(arg)
         return
       end
       local entries = {}
+      -- Lazily fetch head_sha's file content, once per save, only if a pure-insertion hunk
+      -- needs it: an insertion must anchor to head_sha's own line content, not the worktree's
+      -- (an earlier insertion hunk in the same save already shifts the worktree's line numbers).
+      local head_lines, head_fetched = nil, false
+      local function get_head_lines()
+        if not head_fetched then
+          head_fetched = true
+          local hr = gh.run({ "git", "-C", current_pr.worktree, "show", current_pr.head_sha .. ":" .. rel })
+          if hr.code == 0 then
+            -- Empty is the truly-empty (0-byte) file; test that BEFORE stripping the
+            -- trailing newline, so a one-blank-line file ("\n") stays a 1-line {""}
+            -- rather than collapsing to {} and dropping its anchor line.
+            local content = hr.stdout:gsub("\n$", "") -- trailing newline -> no spurious empty last line
+            head_lines = hr.stdout == "" and {} or vim.split(content, "\n", { plain = true })
+          end
+        end
+        return head_lines
+      end
       for _, h in ipairs(diffparse.parse(r.stdout)) do
         local e = diffparse.to_entry(h)
         if e then
@@ -271,9 +289,49 @@ function M.start(arg)
             status = "draft",
             body = "",
           })
+        elseif h.old_count == 0 then
+          local hl = get_head_lines()
+          if not hl then
+            -- e.g. the file is newly added in the PR and absent from head_sha
+            vim.notify(
+              ("prreview: could not read %s@%s to anchor an insertion suggestion"):format(rel, current_pr.head_sha),
+              vim.log.levels.WARN
+            )
+          else
+            local anchor, lines
+            if h.old_start == 0 then
+              -- insertion before head_sha's first line
+              anchor = 1
+              lines = {}
+              vim.list_extend(lines, h.new_lines)
+              if #hl > 0 then
+                lines[#lines + 1] = hl[1]
+              end
+            elseif hl[h.old_start] then
+              anchor = h.old_start
+              lines = { hl[anchor] }
+              vim.list_extend(lines, h.new_lines)
+            end
+            if anchor then
+              entries[#entries + 1] = {
+                path = rel,
+                side = "RIGHT",
+                start_line = anchor,
+                line = anchor,
+                kind = "suggestion",
+                origin = "human",
+                status = "draft",
+                body = "",
+                suggestion = { lines = lines },
+              }
+            else
+              vim.notify(
+                ("prreview: insertion anchor beyond %s@%s's line count — skipped"):format(rel, current_pr.head_sha),
+                vim.log.levels.WARN
+              )
+            end
+          end
         end
-        -- pure insertions (to_entry == nil) are intentionally skipped in v1; not silently
-        -- claimed as handled, just not yet anchored to a following-line suggestion
       end
       local b = state.load_or_init_batch(current_pr)
       local fresh = {}

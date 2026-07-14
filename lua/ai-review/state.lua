@@ -34,7 +34,10 @@ end
 local function write_file(path, text)
   vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
   local tmp = path .. ".tmp"
-  local fd = assert(io.open(tmp, "w"))
+  local fd, err = io.open(tmp, "w")
+  if not fd then
+    error("prreview: cannot write " .. tmp .. ": " .. tostring(err))
+  end
   fd:write(text)
   fd:close()
   os.rename(tmp, path) -- same-fs rename is atomic: no reader ever sees a half-written batch

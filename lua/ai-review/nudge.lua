@@ -2,25 +2,22 @@
 
 local M = {}
 
-local SHELLS = { nvim = true, fish = true, bash = true, zsh = true, sh = true }
+-- Exact match only — a non-shell fallback used to send-keys into an unrelated pane
+-- (a node server, a REPL). Add wrappers here if a setup reports a different command.
+local CLAUDE_CMDS = { claude = true }
 
 --- Pick the claude pane id from `tmux list-panes -F '#{pane_id} #{pane_current_command}'`.
---- Prefer a pane running `claude`; else the first non-shell/non-nvim pane; else nil.
+--- Returns the first pane whose command is a known claude command; else nil (no guessing).
 ---@param list_output string
 ---@return string?
 function M.pick_pane(list_output)
-  local fallback = nil
   for line in (list_output .. "\n"):gmatch("(.-)\n") do
     local id, cmd = line:match("^(%%%d+)%s+(%S+)")
-    if id then
-      if cmd == "claude" then
-        return id
-      elseif not SHELLS[cmd] and not fallback then
-        fallback = id
-      end
+    if id and CLAUDE_CMDS[cmd] then
+      return id
     end
   end
-  return fallback
+  return nil
 end
 
 ---@param pane_id string
