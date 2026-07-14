@@ -888,4 +888,60 @@ describe("ai-review end-to-end", function()
     assert.are.equal("%2", sent[4])
     close_diffview_and_wait()
   end)
+
+  it("PrComments edits the chosen comment's body by id, leaving others untouched", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    local prkey = { owner = "test", repo = "repo", number = 1 }
+    local b = state.load_or_init_batch(prkey)
+    local id1 = batch.add(b, {
+      path = "file.txt",
+      side = "RIGHT",
+      line = 2,
+      kind = "comment",
+      origin = "human",
+      status = "verified",
+      body = "first",
+    })
+    local id2 = batch.add(b, {
+      path = "file.txt",
+      side = "RIGHT",
+      line = 3,
+      kind = "comment",
+      origin = "human",
+      status = "verified",
+      body = "second",
+    })
+    state.save_batch(b)
+
+    -- pick the SECOND comment
+    vim.ui.select = function(items, _, cb)
+      assert.are.equal(2, #items)
+      cb(items[2], 2)
+    end
+    vim.cmd("PrComments")
+    assert.are.equal("prreview://comment/test__repo__pr1/" .. id2, vim.api.nvim_buf_get_name(0))
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, { "second, edited" })
+    vim.cmd("write")
+
+    local after = state.load_or_init_batch(prkey)
+    local by_id = {}
+    for _, c in ipairs(after.comments) do
+      by_id[c.id] = c.body
+    end
+    assert.are.equal("second, edited", by_id[id2])
+    assert.are.equal("first", by_id[id1]) -- untouched
+    vim.cmd("bwipeout!")
+    close_diffview_and_wait()
+  end)
+
+  it("PrComments notifies and opens nothing when there are no comments", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    local opened = false
+    vim.ui.select = function()
+      opened = true
+    end
+    vim.cmd("PrComments")
+    assert.is_false(opened) -- select never called
+    close_diffview_and_wait()
+  end)
 end)

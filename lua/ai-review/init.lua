@@ -411,56 +411,121 @@ function M.suggest()
   end
 end
 
---- Open (or reveal) the review-body scratch buffer for the current PR. A markdown
---- acwrite buffer: :w routes through the batch via BufWriteCmd, nothing hits disk.
---- Prefilled from batch.body on a fresh create so the body builds up across opens.
-function M.body()
-  if not current_pr then
-    vim.notify("prreview: no active review (:PrReviewStart)", vim.log.levels.ERROR)
-    return
-  end
-  local pr = current_pr -- snapshot: the BufWriteCmd must target THIS review's batch,
-  -- not whatever review happens to be active when a later :w fires.
-  local name = ("prreview://body/%s__%s__pr%d"):format(pr.owner, pr.repo, pr.number)
-
+--- Open (or reveal) a named acwrite scratch buffer. On :w it calls on_save(lines) and
+--- marks the buffer unmodified — nothing hits disk. A live buffer of this name is
+--- revealed as-is (no re-prefill, no duplicate BufWriteCmd); a fresh/unloaded one is
+--- created and prefilled from initial_fn(). Any active-review / id-still-valid guard
+--- belongs in on_save (this helper is content-agnostic).
+---@param name string
+---@param initial_fn fun():string  computed only on a fresh create
+---@param on_save fun(lines: string[])
+local function open_scratch_buffer(name, initial_fn, on_save)
   local existing = vim.fn.bufnr(name)
   if existing ~= -1 and vim.api.nvim_buf_is_loaded(existing) then
-    -- reveal the live buffer as-is: preserves unsaved edits, no re-prefill
     vim.cmd("sbuffer " .. existing)
     return
   end
-
   local bufnr = existing ~= -1 and existing or vim.api.nvim_create_buf(true, false)
   if existing == -1 then
     vim.api.nvim_buf_set_name(bufnr, name)
   end
   vim.bo[bufnr].buftype = "acwrite"
   vim.bo[bufnr].filetype = "markdown"
-  local body = state.load_or_init_batch(pr).body or ""
-  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, vim.split(body, "\n", { plain = true }))
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, vim.split(initial_fn(), "\n", { plain = true }))
   vim.bo[bufnr].modified = false
-
   -- clear before attach: reusing an unloaded bufnr with this name would otherwise
-  -- stack a second BufWriteCmd, firing the save (and its notify) once per reuse cycle
+  -- stack a second BufWriteCmd, firing on_save (and its notify) once per reuse cycle
   vim.api.nvim_clear_autocmds({ event = "BufWriteCmd", buffer = bufnr })
   vim.api.nvim_create_autocmd("BufWriteCmd", {
     buffer = bufnr,
     callback = function()
-      if current_pr ~= pr then
-        vim.notify("prreview: body buffer is for a review that's no longer active", vim.log.levels.WARN)
-        return
-      end
-      local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-      local b = state.load_or_init_batch(pr)
-      b.body = table.concat(lines, "\n")
-      state.save_batch(b)
-      overlay.refresh(pr)
+      on_save(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false))
       vim.bo[bufnr].modified = false
-      vim.notify("prreview: body saved")
     end,
   })
-
   vim.cmd("sbuffer " .. bufnr)
+end
+
+--- Open (or reveal) the review-body scratch buffer for the current PR. :w routes the
+--- contents into batch.body via the shared scratch-buffer helper; nothing hits disk.
+function M.body()
+  if not current_pr then
+    vim.notify("prreview: no active review (:PrReviewStart)", vim.log.levels.ERROR)
+    return
+  end
+  local pr = current_pr -- snapshot: a later :w must target THIS review's batch
+  local name = ("prreview://body/%s__%s__pr%d"):format(pr.owner, pr.repo, pr.number)
+  open_scratch_buffer(name, function()
+    return state.load_or_init_batch(pr).body or ""
+  end, function(lines)
+    if current_pr ~= pr then
+      vim.notify("prreview: body buffer is for a review that's no longer active", vim.log.levels.WARN)
+      return
+    end
+    local b = state.load_or_init_batch(pr)
+    b.body = table.concat(lines, "\n")
+    state.save_batch(b)
+    overlay.refresh(pr)
+    vim.notify("prreview: body saved")
+  end)
+end
+
+--- List the batch's comments (vim.ui.select) and open the chosen one's body in a
+--- scratch buffer; :w writes the edited body back to that comment by id. Edits the
+--- `body` prose only — a suggestion's ```suggestion``` block is left as-is.
+function M.comments()
+  if not current_pr then
+    vim.notify("prreview: no active review (:PrReviewStart)", vim.log.levels.ERROR)
+    return
+  end
+  local pr = current_pr -- snapshot: a later :w must target THIS review's batch
+  local b = state.load_or_init_batch(pr)
+  if #b.comments == 0 then
+    vim.notify("prreview: no comments yet", vim.log.levels.WARN)
+    return
+  end
+  local items, ids = {}, {}
+  for _, c in ipairs(b.comments) do
+    local preview = (c.body or ""):gsub("\n.*", "") -- first line only
+    items[#items + 1] = ("%s:%d [%s/%s/%s] %s"):format(c.path, c.line, c.kind, c.origin, c.status, preview)
+    ids[#ids + 1] = c.id
+  end
+  vim.ui.select(items, { prompt = "Edit comment:" }, function(choice, idx)
+    if not choice then
+      return
+    end
+    local id = ids[idx]
+    local name = ("prreview://comment/%s__%s__pr%d/%s"):format(pr.owner, pr.repo, pr.number, id)
+    open_scratch_buffer(name, function()
+      for _, c in ipairs(state.load_or_init_batch(pr).comments) do
+        if c.id == id then
+          return c.body or ""
+        end
+      end
+      return ""
+    end, function(lines)
+      if current_pr ~= pr then
+        vim.notify("prreview: comment buffer is for a review that's no longer active", vim.log.levels.WARN)
+        return
+      end
+      local bb = state.load_or_init_batch(pr)
+      local found = false
+      for _, c in ipairs(bb.comments) do
+        if c.id == id then
+          c.body = table.concat(lines, "\n")
+          found = true
+          break
+        end
+      end
+      if not found then
+        vim.notify("prreview: that comment no longer exists — not saved", vim.log.levels.WARN)
+        return
+      end
+      state.save_batch(bb)
+      overlay.refresh(pr)
+      vim.notify("prreview: comment saved")
+    end)
+  end)
 end
 
 --- Extract a numeric review id from a `gh api ... reviews` POST response, if parseable.
@@ -593,6 +658,7 @@ function M.setup(opts)
   end, { range = true })
   vim.api.nvim_create_user_command("PrSuggest", M.suggest, { range = true })
   vim.api.nvim_create_user_command("PrBody", M.body, {})
+  vim.api.nvim_create_user_command("PrComments", M.comments, {})
   vim.api.nvim_create_user_command("PrReviewRefresh", function()
     if current_pr then
       overlay.refresh(current_pr)
