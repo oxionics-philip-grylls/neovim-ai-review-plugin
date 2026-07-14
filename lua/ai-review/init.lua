@@ -40,7 +40,9 @@ local function start_watch(pr)
     return
   end
   local pending = false
-  handle:start(dir, {}, function(_, filename)
+  -- libuv fs_event:start returns 0 on success, nil+errmsg on failure — 0 is truthy
+  -- in Lua, so test `~= 0`, not `not rc`.
+  local rc = handle:start(dir, {}, function(_, filename)
     if filename and filename ~= base then
       return
     end
@@ -57,6 +59,13 @@ local function start_watch(pr)
       end
     end, 200)
   end)
+  if rc ~= 0 then
+    vim.notify("prreview: live re-render off — use :PrReviewRefresh", vim.log.levels.WARN)
+    pcall(function()
+      handle:close()
+    end)
+    return
+  end
   M._watch = handle
 end
 
@@ -218,6 +227,12 @@ function M.start(arg)
   })
 
   local diffparse = require("ai-review.diffparse")
+  -- A verified suggestion's anchor+lines uniquely identify the hunk it came from;
+  -- re-deriving from the whole-worktree diff on every save would otherwise re-stage
+  -- it as a fresh duplicate draft (A1).
+  local function same_anchor(a, b)
+    return a.start_line == b.start_line and a.line == b.line and vim.deep_equal(a.suggestion.lines, b.suggestion.lines)
+  end
   -- Assumes one active review at a time, like PipPrReviewOverlay below: this augroup's
   -- BufWritePost pattern is pinned to whatever review was most recently started.
   local grp = vim.api.nvim_create_augroup("PrReviewEdit", { clear = true })
@@ -261,11 +276,24 @@ function M.start(arg)
         -- claimed as handled, just not yet anchored to a following-line suggestion
       end
       local b = state.load_or_init_batch(current_pr)
-      batch.replace_drafts_for_path(b, rel, entries)
+      local fresh = {}
+      for _, e in ipairs(entries) do
+        local dup = false
+        for _, c in ipairs(b.comments) do
+          if c.path == rel and c.status == "verified" and c.kind == "suggestion" and same_anchor(e, c) then
+            dup = true
+            break
+          end
+        end
+        if not dup then
+          fresh[#fresh + 1] = e
+        end
+      end
+      batch.replace_drafts_for_path(b, rel, fresh)
       state.save_batch(b)
       overlay.refresh(current_pr)
-      vim.notify(("prreview: staged %d draft suggestion(s) for %s"):format(#entries, rel))
-      if #entries > 0 then
+      vim.notify(("prreview: staged %d draft suggestion(s) for %s"):format(#fresh, rel))
+      if #fresh > 0 then
         nudger.request()
       end
     end,
@@ -275,12 +303,15 @@ function M.start(arg)
 end
 
 ---@param kind "comment"|"question"|"nit"
-local function add_comment(kind)
+---@param range? { [1]: integer, [2]: integer } an explicit [line1, line2] from
+---  a command's `a.range`/`a.line1`/`a.line2`, taking precedence over
+---  diff.cursor_anchor's own mode()-based visual-selection detection.
+local function add_comment(kind, range)
   if not current_pr then
     vim.notify("prreview: no active review (:PrReviewStart)", vim.log.levels.ERROR)
     return
   end
-  local anchor = diff.cursor_anchor()
+  local anchor = diff.cursor_anchor(range)
   if not anchor then
     return
   end
@@ -317,12 +348,49 @@ function M.suggest()
   end
 end
 
+--- Extract a numeric review id from a `gh api ... reviews` POST response, if parseable.
+---@param stdout string
+---@return integer?
+local function parse_review_id(stdout)
+  local ok, j = pcall(vim.json.decode, stdout)
+  if ok and type(j) == "table" and type(j.id) == "number" then
+    return j.id
+  end
+  return nil
+end
+
 function M.submit()
   if not current_pr then
     vim.notify("prreview: no active review (:PrReviewStart)", vim.log.levels.ERROR)
     return
   end
   local b = state.load_or_init_batch(current_pr)
+  -- re-running :PrReviewSubmit (or restarting the PR, which reloads this same batch)
+  -- would otherwise re-POST every verified comment as a second, duplicate review
+  local prior_submitted_at = b.submitted_at
+  if b.submitted_at then
+    if
+      vim.fn.confirm("This review was already submitted at " .. b.submitted_at .. ". Submit again?", "&Yes\n&No", 2)
+      ~= 1
+    then
+      vim.notify("prreview: submit cancelled (already submitted)", vim.log.levels.WARN)
+      return
+    end
+  end
+  -- the batch's comment anchors were computed against current_pr.head_sha; if the PR moved
+  -- since :PrReviewStart, posting against stale line numbers can land comments on the wrong lines
+  local info = gh.pr_info(current_pr.owner, current_pr.repo, current_pr.number)
+  if not info then
+    vim.notify(
+      "prreview: could not verify the PR head is unchanged (gh pr view failed) — proceeding anyway",
+      vim.log.levels.WARN
+    )
+  elseif info.head_sha ~= current_pr.head_sha then
+    if vim.fn.confirm("PR head moved since review start; anchors may be off. Submit anyway?", "&Yes\n&No", 2) ~= 1 then
+      vim.notify("prreview: submit cancelled (PR head moved)", vim.log.levels.WARN)
+      return
+    end
+  end
   local drafts = batch.count_drafts(b)
   if drafts > 0 then
     vim.notify(
@@ -332,6 +400,16 @@ function M.submit()
   end
   vim.ui.select({ "COMMENT", "REQUEST_CHANGES", "APPROVE" }, { prompt = "Verdict:" }, function(verdict)
     if not verdict then
+      return
+    end
+    -- re-read here (not the `b` captured above): a verify-flip landing while this
+    -- picker was open must be included, not silently dropped from the post
+    b = state.load_or_init_batch(current_pr)
+    -- Only bail on a submitted_at that APPEARED while the picker was open (a concurrent
+    -- submit) — not on the one the user already confirmed past at the top of M.submit,
+    -- else the "Submit again?" Yes branch would be unreachable.
+    if b.submitted_at and b.submitted_at ~= prior_submitted_at then
+      vim.notify("prreview: submit cancelled (already submitted at " .. b.submitted_at .. ")", vim.log.levels.WARN)
       return
     end
     b.verdict = verdict
@@ -346,6 +424,9 @@ function M.submit()
     fd:close()
     local r = gh.run(gh.post_review_cmd(current_pr.owner, current_pr.repo, current_pr.number, tmp))
     if r.code == 0 then
+      b.submitted_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
+      b.submitted_review = parse_review_id(r.stdout)
+      state.save_batch(b)
       vim.notify("prreview: review posted")
     else
       vim.notify("prreview: post failed: " .. r.stderr, vim.log.levels.ERROR)
@@ -360,8 +441,12 @@ function M.setup(opts)
   vim.api.nvim_create_user_command("PrReviewStart", function(a)
     M.start(a.args)
   end, { nargs = 1 })
-  vim.api.nvim_create_user_command("PrComment", function()
-    add_comment("comment")
+  vim.api.nvim_create_user_command("PrComment", function(a)
+    -- a.range is 0 for a plain ":PrComment" (line1/line2 default to the
+    -- current line even then) — only an explicit range (":'<,'>", a count)
+    -- should override cursor_anchor's own mode() v/V detection.
+    local range = a.range > 0 and { a.line1, a.line2 } or nil
+    add_comment("comment", range)
   end, { range = true })
   vim.api.nvim_create_user_command("PrSuggest", M.suggest, { range = true })
   vim.api.nvim_create_user_command("PrReviewRefresh", function()
@@ -375,10 +460,20 @@ function M.setup(opts)
       vim.notify("prreview: no active review", vim.log.levels.WARN)
       return
     end
+    local number = current_pr.number
     local wt = current_pr.worktree or state.worktree_path(current_pr)
     if vim.uv.fs_stat(wt) then
+      local status = gh.run({ "git", "-C", wt, "status", "--porcelain" })
+      if status.code == 0 and status.stdout ~= "" then
+        if vim.fn.confirm("worktree has uncommitted changes — discard?", "&Yes\n&No", 2) ~= 1 then
+          vim.notify("prreview: close aborted", vim.log.levels.WARN)
+          return
+        end
+      end
       gh.run(gh.worktree_remove_cmd(wt))
       gh.run(gh.worktree_prune_cmd())
+      -- ignore exit code: a branch checked out elsewhere (e.g. another worktree) refuses to delete
+      gh.run({ "git", "branch", "-D", ("review/pr-%d-suggestions"):format(number) })
     end
     M._stop_watch()
     pcall(vim.fn.delete, state.active_path()) -- clear active.json

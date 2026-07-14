@@ -29,7 +29,11 @@ You can't review a stale diff. Before walking anything:
 When the review was started with `:PrReviewStart` / `checkout-pr-review`, the human's
 Neovim plugin and you share one batch file. Read
 `~/.local/state/nvim/pr-review/active.json` for `{owner, repo, number, base, head_sha,
-batch_path}`. That `batch_path` — not a scratch `review.json` — is your working set.
+batch_path}`. Before trusting it, cross-check `active.json`'s `number` against the PR
+number in your own seed URL — there's only one global `active.json`, so a review started
+after yours (or a stale leftover) can point you at the wrong PR entirely; if they
+disagree, **stop and tell the user** rather than proceeding against the wrong batch.
+That `batch_path` — not a scratch `review.json` — is your working set.
 
 The batch schema (see the plugin's design spec) is:
 `{ pr, verdict, body, comments: [{ id, path, side, line, start_line?, kind, origin,
@@ -94,9 +98,11 @@ process the batch at `active.json.batch_path`:
 - **Write back concurrency-safely.** Verification takes seconds, during which the human may `:w`
   another file and stage new drafts into the *same* batch. Do NOT rewrite the whole batch from the
   copy you read at the start — that silently drops any entry added meanwhile. Immediately before
-  writing, **re-read** the batch and apply your changes only to the specific entries you verified
-  (match by `id`), leaving every other entry untouched; then write **atomically** (tmp + rename) so
-  the plugin's file-watcher sees a complete file and re-renders (draft badges flip to ✓).
+  writing, **re-read** the batch and apply your changes only to the specific entries you verified —
+  match by `id` **and** confirm the entry's `(path, line)` still match what you verified before
+  flipping it (belt-and-braces against an id being reused since you read it) — leaving every other
+  entry untouched; then write **atomically** (tmp + rename) so the plugin's file-watcher sees a
+  complete file and re-renders (draft badges flip to ✓).
 - You never set `verdict` — the human owns it and submits via `:PrReviewSubmit`.
 
 ## 6. Capture cross-cutting issues as handoffs

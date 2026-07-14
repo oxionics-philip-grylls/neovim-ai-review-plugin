@@ -85,6 +85,9 @@ describe("ai-review end-to-end", function()
       pr_info = gh.pr_info,
       cursor_anchor = diff.cursor_anchor,
       ui_input = vim.ui.input,
+      ui_select = vim.ui.select,
+      confirm = vim.fn.confirm,
+      gh_run = gh.run,
       default_root = state.default_root,
     }
     troot = vim.fn.tempname()
@@ -105,8 +108,15 @@ describe("ai-review end-to-end", function()
     if orig_cwd then
       vim.cmd.cd(orig_cwd)
     end
-    url.parse_remote, gh.pr_info, diff.cursor_anchor, vim.ui.input, state.default_root =
-      saved.parse_remote, saved.pr_info, saved.cursor_anchor, saved.ui_input, saved.default_root
+    url.parse_remote, gh.pr_info, gh.run, diff.cursor_anchor, vim.ui.input, vim.ui.select, vim.fn.confirm, state.default_root =
+      saved.parse_remote,
+      saved.pr_info,
+      saved.gh_run,
+      saved.cursor_anchor,
+      saved.ui_input,
+      saved.ui_select,
+      saved.confirm,
+      saved.default_root
     vim.fn.delete(root, "rf")
     vim.fn.delete(troot, "rf")
   end)
@@ -226,6 +236,117 @@ describe("ai-review end-to-end", function()
     assert.are.equal(0, #base_marks)
   end)
 
+  it("cursor_anchor reports RIGHT even with a floating window docked top-right", function()
+    pr.start("https://github.com/test/repo/pull/1")
+
+    local view
+    local ok = vim.wait(2000, function()
+      view = require("diffview.lib").get_current_view()
+      local layout = view and view.cur_layout
+      if
+        not (
+          layout ~= nil
+          and layout.a ~= nil
+          and layout.b ~= nil
+          and layout.a.file ~= nil
+          and layout.b.file ~= nil
+          and layout.a.file.bufnr ~= nil
+          and layout.b.file.bufnr ~= nil
+          and vim.api.nvim_buf_is_valid(layout.a.file.bufnr)
+          and vim.api.nvim_buf_is_valid(layout.b.file.bufnr)
+        )
+      then
+        return false
+      end
+      return vim.api.nvim_buf_get_name(layout.a.file.bufnr) ~= "diffview://null"
+        and vim.api.nvim_buf_get_name(layout.b.file.bufnr) ~= "diffview://null"
+    end, 20)
+    assert.is_true(ok, "diffview's base/head windows never became ready within 2s")
+
+    vim.api.nvim_set_current_win(view.cur_layout.b.id)
+
+    -- A floating window docked at the top-right corner occupies the tabpage's
+    -- rightmost column; the old column heuristic mistook that for the diff's
+    -- head/RIGHT window and misclassified the real (unfloated) cursor window
+    -- as LEFT.
+    local float_buf = vim.api.nvim_create_buf(false, true)
+    local float_win = vim.api.nvim_open_win(float_buf, false, {
+      relative = "editor",
+      row = 0,
+      col = vim.o.columns - 10,
+      width = 10,
+      height = 3,
+      style = "minimal",
+    })
+
+    -- Opening the float transiently reflows diffview's layout back through its
+    -- null-buffer placeholder before re-settling on the real file buffer; wait
+    -- that out (same pattern as the readiness poll above) before reading the anchor.
+    local settled = vim.wait(2000, function()
+      return vim.api.nvim_buf_get_name(0) ~= "diffview://null"
+    end, 10)
+    assert.is_true(settled, "diff buffer never resettled after the float was opened")
+
+    local anchor = diff.cursor_anchor()
+
+    vim.api.nvim_win_close(float_win, true)
+    vim.api.nvim_buf_delete(float_buf, { force = true })
+
+    assert.is_not_nil(anchor)
+    assert.are.equal("RIGHT", anchor.side)
+  end)
+
+  it("PrComment honours an explicit command range (real cursor_anchor, not stubbed)", function()
+    pr.start("https://github.com/test/repo/pull/1")
+
+    local view
+    local ok = vim.wait(2000, function()
+      view = require("diffview.lib").get_current_view()
+      local layout = view and view.cur_layout
+      if
+        not (
+          layout ~= nil
+          and layout.a ~= nil
+          and layout.b ~= nil
+          and layout.a.file ~= nil
+          and layout.b.file ~= nil
+          and layout.a.file.bufnr ~= nil
+          and layout.b.file.bufnr ~= nil
+          and vim.api.nvim_buf_is_valid(layout.a.file.bufnr)
+          and vim.api.nvim_buf_is_valid(layout.b.file.bufnr)
+        )
+      then
+        return false
+      end
+      return vim.api.nvim_buf_get_name(layout.a.file.bufnr) ~= "diffview://null"
+        and vim.api.nvim_buf_get_name(layout.b.file.bufnr) ~= "diffview://null"
+    end, 20)
+    assert.is_true(ok, "diffview's base/head windows never became ready within 2s")
+
+    -- Real cursor_anchor (NOT stubbed): the whole point of B4 is that the command
+    -- callback sees normal mode, so only the threaded a.range keeps the multi-line
+    -- span. Cursor in the RIGHT (head) window.
+    vim.api.nvim_set_current_win(view.cur_layout.b.id)
+    -- the head window can still be showing diffview's 1-line null placeholder for a
+    -- tick after selection; a command range (":2,3") is validated against the window's
+    -- current buffer, so wait for the real 4-line head file before issuing it.
+    local shown = vim.wait(2000, function()
+      return vim.api.nvim_buf_get_name(0) ~= "diffview://null" and vim.api.nvim_buf_line_count(0) >= 3
+    end, 10)
+    assert.is_true(shown, "head window never showed the real file")
+    vim.ui.input = function(_, cb)
+      cb("spans two lines")
+    end
+    vim.cmd("2,3PrComment")
+
+    local b = state.load_or_init_batch({ owner = "test", repo = "repo", number = 1 })
+    assert.are.equal(1, #b.comments)
+    assert.are.equal(2, b.comments[1].start_line)
+    assert.are.equal(3, b.comments[1].line)
+    assert.are.equal("RIGHT", b.comments[1].side)
+    close_diffview_and_wait()
+  end)
+
   it("creates the review worktree on start and removes it on close", function()
     pr.start("https://github.com/test/repo/pull/1")
     local wt = state.worktree_path({ owner = "test", repo = "repo", number = 1 }, troot)
@@ -233,6 +354,51 @@ describe("ai-review end-to-end", function()
     assert.is_not_nil(require("ai-review.state").read_active(troot).worktree)
     vim.cmd("PrReviewClose")
     assert.is_nil(vim.uv.fs_stat(wt))
+  end)
+
+  it("aborts close when the worktree is dirty and the user declines to discard", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    local wt = state.worktree_path({ owner = "test", repo = "repo", number = 1 }, troot)
+    -- dirty the checked-out file directly (not through the BufWritePost staging path)
+    vim.fn.writefile({ "line1", "DIRTY", "line3", "line4-added" }, wt .. "/file.txt")
+    vim.fn.confirm = function()
+      return 2 -- "No" — decline the discard
+    end
+    vim.cmd("PrReviewClose")
+    -- dirty worktree + active.json must both survive a declined close
+    assert.is_not_nil(vim.uv.fs_stat(wt))
+    assert.is_not_nil(state.read_active(troot))
+  end)
+
+  it("watcher-start failure notifies and leaves M._watch unset, without aborting start", function()
+    local orig_new_fs_event = vim.uv.new_fs_event
+    local fake_handle = {
+      start = function()
+        return -1 -- simulate libuv fs_event:start failure
+      end,
+      close = function() end,
+    }
+    vim.uv.new_fs_event = function()
+      return fake_handle
+    end
+    local warned = false
+    local orig_notify = vim.notify
+    vim.notify = function(msg, level)
+      if level == vim.log.levels.WARN and msg:find("live re-render off", 1, true) then
+        warned = true
+      end
+    end
+
+    pr.start("https://github.com/test/repo/pull/1")
+
+    vim.uv.new_fs_event = orig_new_fs_event
+    vim.notify = orig_notify
+    assert.is_true(warned, "expected the watcher-start-failure WARN")
+    assert.is_nil(pr._watch)
+    -- start() must otherwise have completed normally (worktree present, review active)
+    local wt = state.worktree_path({ owner = "test", repo = "repo", number = 1 }, troot)
+    assert.is_not_nil(vim.uv.fs_stat(wt))
+    vim.cmd("PrReviewClose")
   end)
 
   it("staging: editing a worktree file on save produces a draft suggestion", function()
@@ -268,6 +434,35 @@ describe("ai-review end-to-end", function()
       end
     end
     assert.are.equal(1, n)
+  end)
+  it("staging: does not re-stage an already-verified hunk when a different hunk is saved", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    local prkey = { owner = "test", repo = "repo", number = 1 }
+    local wt = state.worktree_path(prkey, troot)
+    local f = wt .. "/file.txt"
+    vim.cmd("edit " .. vim.fn.fnameescape(f))
+    -- hunk1: edit line 1 ("line1" -> ...), save, then verify it out-of-band
+    vim.api.nvim_buf_set_lines(0, 0, 1, false, { "SUGGESTED line 1" })
+    vim.cmd("write")
+    local b = state.load_or_init_batch(prkey)
+    assert.are.equal(1, #b.comments)
+    b.comments[1].status = "verified"
+    state.save_batch(b)
+
+    -- hunk2: edit line 3 (a different, non-adjacent region of the same file), save
+    vim.api.nvim_buf_set_lines(0, 2, 3, false, { "SUGGESTED line 3" })
+    vim.cmd("write")
+
+    local b2 = state.load_or_init_batch(prkey)
+    assert.are.equal(2, #b2.comments) -- hunk1 verified + hunk2 draft, NOT a re-staged hunk1 duplicate
+    local by_line = {}
+    for _, c in ipairs(b2.comments) do
+      by_line[c.line] = c
+    end
+    assert.are.equal("verified", by_line[1].status)
+    assert.are.same({ "SUGGESTED line 1" }, by_line[1].suggestion.lines)
+    assert.are.equal("draft", by_line[3].status)
+    assert.are.same({ "SUGGESTED line 3" }, by_line[3].suggestion.lines)
   end)
   it("resets a stale worktree to the current head on re-start", function()
     pr.start("https://github.com/test/repo/pull/1")
@@ -332,6 +527,79 @@ describe("ai-review end-to-end", function()
       return false
     end, 50)
     assert.is_true(got_verified, "verified flip did not re-render within 3s")
+    close_diffview_and_wait()
+  end)
+
+  it("records submitted_at and refuses a second submit", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    local prkey = { owner = "test", repo = "repo", number = 1 }
+    local b = state.load_or_init_batch(prkey)
+    batch.add(b, {
+      path = "file.txt",
+      side = "RIGHT",
+      line = 2,
+      kind = "comment",
+      origin = "human",
+      status = "verified",
+      body = "ok",
+    })
+    state.save_batch(b)
+    local posts = 0
+    local real_run = gh.run
+    gh.run = function(cmd)
+      if cmd[1] == "gh" and cmd[2] == "api" then
+        posts = posts + 1
+        return { code = 0, stdout = "{}", stderr = "" }
+      end
+      return real_run(cmd)
+    end
+    vim.ui.select = function(_, _, cb)
+      cb("COMMENT")
+    end
+    vim.fn.confirm = function()
+      return 2
+    end -- "no" to any re-submit confirm
+    pr.submit()
+    assert.are.equal(1, posts)
+    assert.is_not_nil(state.load_or_init_batch(prkey).submitted_at)
+    pr.submit() -- second time: submitted_at set → refuse
+    assert.are.equal(1, posts)
+    close_diffview_and_wait()
+  end)
+
+  it("posts again when the user confirms a re-submit", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    local prkey = { owner = "test", repo = "repo", number = 1 }
+    local b = state.load_or_init_batch(prkey)
+    batch.add(b, {
+      path = "file.txt",
+      side = "RIGHT",
+      line = 2,
+      kind = "comment",
+      origin = "human",
+      status = "verified",
+      body = "ok",
+    })
+    state.save_batch(b)
+    local posts = 0
+    local real_run = gh.run
+    gh.run = function(cmd)
+      if cmd[1] == "gh" and cmd[2] == "api" then
+        posts = posts + 1
+        return { code = 0, stdout = "{}", stderr = "" }
+      end
+      return real_run(cmd)
+    end
+    vim.ui.select = function(_, _, cb)
+      cb("COMMENT")
+    end
+    vim.fn.confirm = function()
+      return 1
+    end -- "yes" — allow the re-submit through
+    pr.submit()
+    assert.are.equal(1, posts)
+    pr.submit() -- confirmed re-submit: the already-confirmed submitted_at must NOT block it
+    assert.are.equal(2, posts)
     close_diffview_and_wait()
   end)
 end)

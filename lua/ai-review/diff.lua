@@ -39,11 +39,26 @@ local function rel_path()
   return entry and entry.path or nil
 end
 
---- Which diff side the cursor window shows. diffview's Diff2Hor layout splits
---- base ("a") to the left and head ("b") to the right of the file panel; the
---- rightmost window in the tab is always the head/right side.
+--- Which diff side the cursor window shows. Reads diffview's own layout model
+--- (view.cur_layout.a/b are the base/head Windows, mirroring overlay.side_bufs)
+--- instead of a column-position heuristic: a third window in the tab (a
+--- floating popup, quickfix, ...) can occupy the tabpage's rightmost column
+--- without being either diff side, misclassifying the real cursor window.
 ---@return "RIGHT"|"LEFT"
 local function cursor_side()
+  local view = lib.get_current_view()
+  local layout = view and view.cur_layout
+  if layout and layout.a and layout.b then
+    local cur = vim.api.nvim_get_current_win()
+    if cur == layout.a.id then
+      return "LEFT"
+    elseif cur == layout.b.id then
+      return "RIGHT"
+    end
+  end
+
+  -- Fall back to the column heuristic when the layout/window ids aren't
+  -- available (e.g. outside a diffview session, or a layout with no a/b).
   local wins = vim.api.nvim_tabpage_list_wins(0)
   local cur = vim.api.nvim_get_current_win()
   local cur_col = vim.api.nvim_win_get_position(cur)[2]
@@ -54,14 +69,23 @@ local function cursor_side()
   return cur_col >= max_col and "RIGHT" or "LEFT"
 end
 
+---@param range? { [1]: integer, [2]: integer } an explicit [lo, hi] line range
+---  (from a `:'<,'>` command range), taking precedence over the mode()-based
+---  v/V detection below. A command callback only sees normal mode by the
+---  time it runs, even after a `:'<,'>` prefix, so the caller must thread its
+---  own a.range/a.line1/a.line2 through here instead.
 ---@return { path: string, line: integer, start_line?: integer, side: "RIGHT"|"LEFT" }?
-function M.cursor_anchor()
+function M.cursor_anchor(range)
   local path = rel_path()
   if not path then
     return nil
   end
 
   local side = cursor_side()
+  if range then
+    local lo, hi = math.min(range[1], range[2]), math.max(range[1], range[2])
+    return { path = path, start_line = lo, line = hi, side = side }
+  end
   local mode = vim.fn.mode()
   if mode == "v" or mode == "V" then
     local a = vim.fn.line("v")

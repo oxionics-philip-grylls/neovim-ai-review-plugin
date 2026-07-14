@@ -236,6 +236,125 @@ describe("ai-review.batch.replace_drafts_for_path", function()
   end)
 end)
 
+describe("ai-review.batch next_id", function()
+  local pr = { owner = "o", repo = "r", number = 5, base = "master", head_sha = "abc" }
+
+  it("persists next_id across an encode/decode round-trip", function()
+    local b = batch.new(pr)
+    batch.add(
+      b,
+      { path = "a.rs", side = "RIGHT", line = 1, kind = "comment", origin = "human", status = "draft", body = "x" }
+    )
+    local b2 = batch.decode(batch.encode(b))
+    assert.are.equal(b.next_id, b2.next_id)
+  end)
+
+  it("never reuses an id even after replace_drafts_for_path removes the max", function()
+    local b = batch.new(pr)
+    batch.add(b, {
+      path = "a",
+      side = "RIGHT",
+      line = 1,
+      kind = "suggestion",
+      origin = "human",
+      status = "draft",
+      body = "",
+      suggestion = { lines = { "one" } },
+    })
+    local id2 = batch.add(b, {
+      path = "a",
+      side = "RIGHT",
+      line = 2,
+      kind = "suggestion",
+      origin = "human",
+      status = "draft",
+      body = "",
+      suggestion = { lines = { "two" } },
+    })
+    assert.are.equal("c2", id2)
+    -- removes both human drafts on "a" (id1 and the current max, id2), adding nothing back
+    batch.replace_drafts_for_path(b, "a", {})
+    assert.are.equal(0, #b.comments)
+    local id3 = batch.add(b, {
+      path = "a",
+      side = "RIGHT",
+      line = 3,
+      kind = "suggestion",
+      origin = "human",
+      status = "draft",
+      body = "",
+      suggestion = { lines = { "three" } },
+    })
+    assert.are.equal("c3", id3) -- not "c1": the persistent counter, not a max-over-survivors recompute
+  end)
+
+  it("seeds next_id from max-suffix+1 on a legacy batch that has no counter", function()
+    -- a batch decoded from a pre-counter file: has entries but no next_id
+    local b = {
+      pr = pr,
+      body = "",
+      comments = {
+        {
+          id = "c5",
+          path = "a",
+          side = "RIGHT",
+          line = 1,
+          kind = "comment",
+          origin = "human",
+          status = "draft",
+          body = "",
+        },
+      },
+    }
+    local id = batch.add(
+      b,
+      { path = "a", side = "RIGHT", line = 2, kind = "comment", origin = "human", status = "draft", body = "" }
+    )
+    assert.are.equal("c6", id) -- max existing suffix (5) + 1, not c1 or c2
+    assert.are.equal(7, b.next_id)
+  end)
+
+  it("encode output carries next_id but strips the non-persisted _loaded_mtime", function()
+    local b = batch.new(pr)
+    b._loaded_mtime = { sec = 1, nsec = 2 }
+    local encoded = batch.encode(b)
+    assert.is_truthy(encoded:find('"next_id"', 1, true))
+    assert.is_nil(encoded:find("_loaded_mtime", 1, true))
+  end)
+end)
+
+describe("ai-review.batch.validate", function()
+  local pr = { owner = "o", repo = "r", number = 5, base = "master", head_sha = "abc" }
+
+  it("drops malformed entries but keeps valid ones, notifying once per drop", function()
+    local decoded = {
+      pr = pr,
+      body = "",
+      next_id = 4,
+      comments = {
+        { id = "c1", path = "a.rs", side = "RIGHT", line = 1, kind = "comment", status = "draft", body = "ok" },
+        { id = "c2", path = "a.rs", side = "RIGHT", kind = "comment", status = "draft", body = "no line" },
+        { id = "c3", path = "a.rs", side = "UP", line = 1, kind = "comment", status = "draft", body = "bad side" },
+      },
+    }
+    local notified = 0
+    local orig_notify = vim.notify
+    vim.notify = function()
+      notified = notified + 1
+    end
+    local v = batch.validate(decoded)
+    vim.notify = orig_notify
+    assert.are.equal(1, #v.comments)
+    assert.are.equal("c1", v.comments[1].id)
+    assert.are.equal(2, notified)
+  end)
+
+  it("never nils comments, even when decoded.comments isn't a list", function()
+    local v = batch.validate({ pr = pr, body = "", comments = "garbage" })
+    assert.are.same({}, v.comments)
+  end)
+end)
+
 describe("ai-review.batch.add id uniqueness", function()
   local pr = { owner = "o", repo = "r", number = 5, base = "master", head_sha = "abc" }
   local function draft(line, origin)

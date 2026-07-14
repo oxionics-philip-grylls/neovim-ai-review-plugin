@@ -31,28 +31,35 @@ local M = {}
 ---@field verdict? "APPROVE"|"COMMENT"|"REQUEST_CHANGES"
 ---@field body string
 ---@field comments prreview.Comment[]
+---@field next_id integer monotonic id counter; persisted so ids never reuse across saves
+---@field submitted_at? string
+---@field submitted_review? integer
+---@field _loaded_mtime? { sec: integer, nsec: integer } generation stamp; not persisted
 
 ---@param pr prreview.PR
 ---@return prreview.Batch
 function M.new(pr)
-  return { pr = pr, verdict = nil, body = "", comments = {} }
+  return { pr = pr, verdict = nil, body = "", comments = {}, next_id = 1 }
 end
 
 ---@param b prreview.Batch
 ---@param entry prreview.Comment
 ---@return string id
 function M.add(b, entry)
-  -- Allocate max-existing-suffix + 1, not #comments + 1: after replace_drafts_for_path
-  -- removes then re-adds entries, a positional id could collide with a surviving entry's.
-  -- peer-review flips drafts by id, so ids must stay unique among current entries.
-  local max = 0
-  for _, c in ipairs(b.comments) do
-    local n = tonumber(tostring(c.id or ""):match("^c(%d+)$") or "")
-    if n and n > max then
-      max = n
+  if b.next_id == nil then
+    -- legacy batch decoded from a file predating the persistent counter: seed it from
+    -- the current max so we don't collide with existing entries
+    local max = 0
+    for _, c in ipairs(b.comments) do
+      local n = tonumber(tostring(c.id or ""):match("^c(%d+)$") or "")
+      if n and n > max then
+        max = n
+      end
     end
+    b.next_id = max + 1
   end
-  entry.id = "c" .. (max + 1)
+  entry.id = "c" .. b.next_id
+  b.next_id = b.next_id + 1
   b.comments[#b.comments + 1] = entry
   return entry.id
 end
@@ -72,13 +79,58 @@ end
 ---@param b prreview.Batch
 ---@return string
 function M.encode(b)
-  return vim.json.encode(b)
+  local persisted = {}
+  for k, v in pairs(b) do
+    if not tostring(k):match("^_") then
+      persisted[k] = v
+    end
+  end
+  return vim.json.encode(persisted)
 end
 
 ---@param s string
 ---@return prreview.Batch
 function M.decode(s)
   return vim.json.decode(s)
+end
+
+local VALID_SIDES = { RIGHT = true, LEFT = true }
+local VALID_STATUSES = { draft = true, verified = true }
+local VALID_KINDS = { comment = true, suggestion = true, question = true, nit = true }
+
+---@param n unknown
+---@return boolean
+local function is_integer(n)
+  return type(n) == "number" and n == math.floor(n)
+end
+
+--- Lenient post-decode sanitizer for a batch that may have been hand-edited or written
+--- by another process: drops entries that aren't well-shaped rather than rejecting the
+--- whole file, so one bad entry can't take down the entire review session.
+---@param decoded table
+---@return prreview.Batch
+function M.validate(decoded)
+  if type(decoded.comments) ~= "table" then
+    decoded.comments = {}
+    return decoded
+  end
+  local kept = {}
+  for _, c in ipairs(decoded.comments) do
+    local ok = type(c) == "table"
+      and type(c.path) == "string"
+      and is_integer(c.line)
+      and VALID_SIDES[c.side]
+      and VALID_STATUSES[c.status]
+      and VALID_KINDS[c.kind]
+    if ok then
+      kept[#kept + 1] = c
+    else
+      local id = (type(c) == "table" and c.id) or "?"
+      vim.notify("prreview: dropping malformed batch entry " .. tostring(id), vim.log.levels.WARN)
+    end
+  end
+  decoded.comments = kept
+  return decoded
 end
 
 ---@param c prreview.Comment

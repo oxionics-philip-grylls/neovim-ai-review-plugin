@@ -46,7 +46,8 @@ end
 function M.render(b)
   local view = require("diffview.lib").get_current_view()
   if not view or not view.cur_entry then
-    M.clear()
+    -- No live redraw here (e.g. a watcher-triggered refresh while another tab is
+    -- current): clearing would wipe extmarks nothing is about to replace.
     return
   end
   local path = view.cur_entry.path
