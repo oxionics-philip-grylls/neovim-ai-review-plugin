@@ -303,6 +303,7 @@ function M.start(arg)
       vim.keymap.set("n", "i", "<cmd>PrSuggest<cr>", { buffer = 0, desc = "PR: edit on branch to suggest" })
       vim.keymap.set("n", "<leader>re", "<cmd>PrSuggest<cr>", { buffer = 0, desc = "PR: edit on branch to suggest" })
       vim.keymap.set("n", "R", "<cmd>PrReviewed<cr>", { buffer = 0, desc = "PR: toggle file reviewed" })
+      vim.keymap.set("n", "gO", "<cmd>PrGoto<cr>", { buffer = 0, desc = "PR: open real file here (LSP nav)" })
     end,
   })
   vim.api.nvim_create_autocmd("BufWritePost", {
@@ -464,6 +465,32 @@ function M.suggest()
     -- head-checked-out worktree file, so jumping there would silently land on the wrong line
     vim.notify("prreview: opened on the PR branch — LEFT-side line numbers don't map here", vim.log.levels.WARN)
   end
+end
+
+--- Open the worktree file under the cursor at the SAME line+column, in a vsplit. The diff
+--- panes are diffview git-object buffers (no LSP attaches); the worktree is a real checkout,
+--- so pyright is live there — native gd/grr work once you land on the symbol. RIGHT side
+--- only: its lines map 1:1 to the head-checked-out worktree file.
+function M.goto_file()
+  if not current_pr then
+    vim.notify("prreview: no active review (:PrReviewStart)", vim.log.levels.ERROR)
+    return
+  end
+  local col = vim.fn.col(".") - 1 -- capture before the split; 0-based for nvim_win_set_cursor
+  local anchor = diff.cursor_anchor()
+  if not anchor then
+    return
+  end
+  if anchor.side ~= "RIGHT" then
+    vim.notify(
+      "prreview: LSP-goto works from the RIGHT (head) side — LEFT lines don't map to the worktree",
+      vim.log.levels.WARN
+    )
+    return
+  end
+  local wt = current_pr.worktree or state.worktree_path(current_pr)
+  vim.cmd("vsplit " .. vim.fn.fnameescape(wt .. "/" .. anchor.path))
+  pcall(vim.api.nvim_win_set_cursor, 0, { anchor.line, col })
 end
 
 --- Open (or reveal) a named acwrite scratch buffer. On :w it calls on_save(lines) and
@@ -744,6 +771,7 @@ function M.setup(opts)
     add_comment("comment", range)
   end, { range = true })
   vim.api.nvim_create_user_command("PrSuggest", M.suggest, { range = true })
+  vim.api.nvim_create_user_command("PrGoto", M.goto_file, {})
   vim.api.nvim_create_user_command("PrBody", M.body, {})
   vim.api.nvim_create_user_command("PrComments", M.comments, {})
   vim.api.nvim_create_user_command("PrReviewed", M.toggle_reviewed, {})

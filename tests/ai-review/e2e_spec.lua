@@ -175,6 +175,45 @@ describe("ai-review end-to-end", function()
     assert.is_true(pcall(vim.json.encode, r))
   end)
 
+  it("PrGoto opens the real worktree file at the cursor line AND column (RIGHT side)", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    -- put the cursor at a known non-zero column so we prove the column is CAPTURED before
+    -- the vsplit (a capture-after-split regression would land at col 0 and fail this).
+    vim.cmd("enew")
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, { "abcdefgh" })
+    vim.api.nvim_win_set_cursor(0, { 1, 4 }) -- col 5 (1-based) → captured as 4 (0-based)
+    diff.cursor_anchor = function()
+      return { path = "file.txt", line = 3, side = "RIGHT" }
+    end
+    vim.cmd("PrGoto")
+    local wt = state.worktree_path({ owner = "test", repo = "repo", number = 1 })
+    assert.are.equal(wt .. "/file.txt", vim.api.nvim_buf_get_name(0))
+    assert.are.same({ 3, 4 }, vim.api.nvim_win_get_cursor(0)) -- line 3, column preserved
+    vim.cmd("bwipeout!")
+    close_diffview_and_wait()
+  end)
+
+  it("PrGoto on a LEFT-side line warns and does not open the worktree file", function()
+    pr.start("https://github.com/test/repo/pull/1")
+    diff.cursor_anchor = function()
+      return { path = "file.txt", line = 2, side = "LEFT" }
+    end
+    local before = vim.api.nvim_buf_get_name(0)
+    local warned = false
+    local orig = vim.notify
+    vim.notify = function(msg, lvl)
+      if type(msg) == "string" and msg:find("LEFT lines don't map", 1, true) then
+        warned = true
+      end
+      return orig(msg, lvl)
+    end
+    vim.cmd("PrGoto")
+    vim.notify = orig
+    assert.is_true(warned)
+    assert.are.equal(before, vim.api.nvim_buf_get_name(0)) -- no new buffer opened
+    close_diffview_and_wait()
+  end)
+
   it("routes a RIGHT-side comment to the head buffer, not the base buffer", function()
     pr.start("https://github.com/test/repo/pull/1")
 
