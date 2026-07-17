@@ -17,6 +17,9 @@ M._watch = nil
 -- Snacks explorer picker opened on the RIGHT during a review (diffview's diff panel
 -- holds the left). Captured so we close exactly this one on :PrReviewClose.
 M._review_tree = nil
+-- The Claude /peer-review session, run as a plugin-owned snacks terminal (bottom split).
+-- job is its channel — nudges are nvim_chan_send'd straight to Claude's stdin.
+M._claude = nil ---@type { win: any, buf: integer, job: integer }|nil
 
 --- Stop the batch fs-watcher (idempotent).
 function M._stop_watch()
@@ -36,6 +39,19 @@ function M._close_review_tree()
       M._review_tree:close()
     end)
     M._review_tree = nil
+  end
+end
+
+--- Kill the Claude terminal + its job, if we spawned one (idempotent, pcall-guarded).
+function M._close_claude()
+  if M._claude then
+    pcall(vim.fn.jobstop, M._claude.job)
+    if M._claude.win then
+      pcall(function()
+        M._claude.win:close()
+      end)
+    end
+    M._claude = nil
   end
 end
 
@@ -68,6 +84,39 @@ local function open_review_tree()
         },
       },
     })
+  end)
+end
+
+--- Spawn the Claude /peer-review session as a bottom-split terminal we own, capturing its
+--- channel for chansend nudges. No-op without snacks (headless tests). enter=false so it
+--- doesn't steal focus from the diff.
+---@param pr_url string
+local function open_claude(pr_url)
+  M._close_claude() -- a restart without :PrReviewClose would otherwise orphan the old job+window
+  local ok, snacks = pcall(require, "snacks")
+  if not ok then
+    return
+  end
+  pcall(function()
+    local term = snacks.terminal.open(('claude "/peer-review %s"'):format(pr_url), {
+      cwd = vim.uv.cwd(),
+      start_insert = false,
+      auto_insert = false,
+      win = { position = "bottom", enter = false },
+    })
+    local buf = term and term.buf
+    if not buf then
+      return
+    end
+    M._claude = { win = term, buf = buf, job = vim.b[buf].terminal_job_id }
+    if not M._claude.job then
+      -- terminal_job_id can lag the open by a tick; grab it on the next loop
+      vim.defer_fn(function()
+        if M._claude and M._claude.buf == buf then
+          M._claude.job = vim.b[buf].terminal_job_id
+        end
+      end, 50)
+    end
   end)
 end
 
@@ -245,17 +294,6 @@ local function changed_file_count(pr)
   return n
 end
 
--- Locate the claude pane in this PR's tmux session (ai-rev-pr<n>), or nil.
--- pcall: tmux may be absent (vim.system throws ENOENT, not a nonzero code).
-local function find_claude_pane(pr)
-  local sess = ("ai-rev-pr%d"):format(pr.number)
-  local ok, r = pcall(gh.run, { "tmux", "list-panes", "-t", sess, "-F", "#{pane_id} #{pane_current_command}" })
-  if not ok or r.code ~= 0 then
-    return nil
-  end
-  return nudge.pick_pane(r.stdout)
-end
-
 --- Create the review worktree at `wt` on branch review/pr-<n>-suggestions checked
 --- out at pr.head_sha, retrying once behind a prune (add refuses a stale admin
 --- entry that prune clears). Notifies and returns false on hard failure.
@@ -335,12 +373,13 @@ function M.start(arg)
     state.save_batch(batch.new(pr))
   end
   diff.open(pr.base) -- the review tree opens on DiffviewViewOpened (post-layout), not here
+  open_claude(string.format("https://github.com/%s/%s/pull/%d", pr.owner, pr.repo, pr.number))
   overlay.refresh(pr)
   -- Watch the batch file: when Claude (peer-review) flips draft→verified and writes it
   -- back, re-render so the flip shows without the human doing anything.
   start_watch(pr)
 
-  -- Debounced nudge: after staging drafts, poke the claude pane (if present) to verify them.
+  -- Debounced nudge: after staging drafts, poke Claude's terminal (if present) to verify them.
   local nudger = nudge.make({
     delay_ms = 1500,
     msg = ("prreview: new draft suggestion(s) in %s — verify and flip to verified"):format(state.batch_path(pr)),
@@ -352,11 +391,11 @@ function M.start(arg)
       end
       return batch.count_drafts(state.load_or_init_batch(pr))
     end,
-    find_pane = function()
-      return find_claude_pane(pr)
-    end,
-    send = function(cmd)
-      pcall(gh.run, cmd) -- best-effort; a send-keys failure must never surface
+    send = function(msg)
+      -- write straight to Claude's stdin; no-op if the terminal's gone
+      if M._claude and M._claude.job then
+        pcall(vim.api.nvim_chan_send, M._claude.job, msg .. "\r")
+      end
     end,
     schedule = function(ms, fn)
       vim.defer_fn(fn, ms)
@@ -820,12 +859,11 @@ function M.submit()
         if choice == "Write it now" then
           M.body()
         elseif choice == "Let Claude write it" then
-          local pane = find_claude_pane(current_pr)
-          if pane then
-            pcall(gh.run, nudge.nudge_cmd(pane, nudge.body_request_msg(state.batch_path(current_pr))))
+          if M._claude and M._claude.job then
+            pcall(vim.api.nvim_chan_send, M._claude.job, nudge.body_request_msg(state.batch_path(current_pr)) .. "\r")
             vim.notify("prreview: asked Claude to write the body — re-run :PrReviewSubmit when it's done")
           else
-            vim.notify("prreview: no claude pane found — write the body with :PrBody", vim.log.levels.WARN)
+            vim.notify("prreview: no Claude session — write the body with :PrBody", vim.log.levels.WARN)
           end
         elseif choice == "Submit without a body" then
           do_verdict()
@@ -884,6 +922,7 @@ function M.setup(opts)
     end
     M._stop_watch()
     M._close_review_tree()
+    M._close_claude()
     panel.detach()
     pcall(vim.fn.delete, state.active_path()) -- clear active.json
     overlay.clear()
@@ -943,6 +982,7 @@ function M.setup(opts)
     callback = function()
       M._stop_watch()
       M._close_review_tree()
+      M._close_claude()
       panel.detach()
     end,
   })

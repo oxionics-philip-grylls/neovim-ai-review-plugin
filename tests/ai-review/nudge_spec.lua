@@ -1,76 +1,64 @@
 local nudge = require("ai-review.nudge")
 
-describe("ai-review.nudge.pick_pane", function()
-  it("picks the claude pane", function()
-    assert.are.equal("%2", nudge.pick_pane("%1 nvim\n%2 claude\n"))
-  end)
-  it("returns nil for a non-claude pane — no guessing at an unrelated process", function()
-    assert.is_nil(nudge.pick_pane("%1 nvim\n%3 node\n"))
-  end)
-  it("returns nil when only nvim/shells are present", function()
-    assert.is_nil(nudge.pick_pane("%1 nvim\n%2 fish\n"))
-  end)
-end)
-
-describe("ai-review.nudge.nudge_cmd", function()
-  it("builds the send-keys command", function()
-    assert.are.same({ "tmux", "send-keys", "-t", "%2", "hi", "Enter" }, nudge.nudge_cmd("%2", "hi"))
-  end)
-end)
-
 describe("ai-review.nudge.make", function()
-  local function harness(drafts, pane)
-    local fired, sends = {}, {}
-    local n = nudge.make({
-      delay_ms = 1500,
-      msg = "verify drafts",
-      count_drafts = function()
-        return drafts
-      end,
-      find_pane = function()
-        return pane
-      end,
-      send = function(cmd)
-        sends[#sends + 1] = cmd
-      end,
-      schedule = function(_, fn)
-        fired[#fired + 1] = fn
-      end, -- capture, don't run
-    })
-    return n, fired, sends
+  local function immediate_schedule(_, fn)
+    fn()
   end
 
-  it("coalesces N rapid requests into one scheduled fire → one send", function()
-    local n, fired, sends = harness(2, "%2")
+  it("sends the message when there are drafts", function()
+    local sent = {}
+    local n = nudge.make({
+      delay_ms = 0,
+      msg = "verify please",
+      count_drafts = function()
+        return 2
+      end,
+      send = function(m)
+        sent[#sent + 1] = m
+      end,
+      schedule = immediate_schedule,
+    })
     n.request()
-    n.request()
-    n.request()
-    assert.are.equal(1, #fired) -- armed once
-    fired[1]() -- fire the timer
-    assert.are.equal(1, #sends)
-    assert.are.same({ "tmux", "send-keys", "-t", "%2", "verify drafts", "Enter" }, sends[1])
+    assert.are.same({ "verify please" }, sent)
   end)
 
   it("does not send when there are no drafts", function()
-    local n, fired, sends = harness(0, "%2")
+    local sent = 0
+    local n = nudge.make({
+      delay_ms = 0,
+      msg = "x",
+      count_drafts = function()
+        return 0
+      end,
+      send = function()
+        sent = sent + 1
+      end,
+      schedule = immediate_schedule,
+    })
     n.request()
-    fired[1]()
-    assert.are.equal(0, #sends)
+    assert.are.equal(0, sent)
   end)
 
-  it("does not send when no pane is found", function()
-    local n, fired, sends = harness(3, nil)
+  it("coalesces concurrent requests into one send", function()
+    local pending
+    local sent = 0
+    local n = nudge.make({
+      delay_ms = 0,
+      msg = "x",
+      count_drafts = function()
+        return 1
+      end,
+      send = function()
+        sent = sent + 1
+      end,
+      schedule = function(_, fn)
+        pending = fn
+      end, -- capture, fire manually
+    })
     n.request()
-    fired[1]()
-    assert.are.equal(0, #sends)
-  end)
-
-  it("re-arms after firing", function()
-    local n, fired, sends = harness(1, "%2")
+    n.request() -- armed → no-op
     n.request()
-    fired[1]()
-    n.request()
-    fired[2]()
-    assert.are.equal(2, #sends)
+    pending() -- one deferred fire
+    assert.are.equal(1, sent)
   end)
 end)

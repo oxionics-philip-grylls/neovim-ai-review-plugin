@@ -1,36 +1,11 @@
 #!/usr/bin/env bash
-# Launch an AI-paired PR review in one tmux session `ai-rev-pr<n>`: nvim (our plugin) on top
-# running :PrReviewStart, a claude pane below seeded with /peer-review on the same PR.
-# Idempotent: re-running for the same PR attaches/switches to the existing session. Run from
-# inside a clone of the PR's repo — :PrReviewStart's cross-repo guard enforces the match.
-# Seed defaults to `claude "/peer-review <url>"` per plan; confirm against a real PR (manual
-# step) and switch to the natural-language fallback here if the slash form doesn't trigger it.
+# Launch an AI-paired PR review inside one nvim: :PrReviewStart opens diffview, spawns the
+# Claude /peer-review session as a plugin-owned bottom-split terminal, and starts the review.
+# Run from inside a clone of the PR's repo — :PrReviewStart's cross-repo guard enforces the
+# match, and validates the argument (a GitHub PR URL, or a bare PR number inside the repo).
+# No tmux: Claude now runs as an in-nvim terminal, nudged over its channel.
 set -euo pipefail
 
-[[ $# -eq 1 ]] || { echo "usage: checkout-pr-review <github-pr-url>" >&2; exit 2; }
-url=$1
-if [[ ! $url =~ github\.com[/:][^/]+/[^/]+/pull/([0-9]+) ]]; then
-    echo "checkout-pr-review: not a GitHub PR URL: $url" >&2
-    exit 2
-fi
-window="ai-rev-pr${BASH_REMATCH[1]}"
-repo_dir=$PWD
+[[ $# -eq 1 ]] || { echo "usage: checkout-pr-review <github-pr-url | pr-number>" >&2; exit 2; }
 
-# The review is always a session named ai-rev-pr<n> — one identity space, so there's no
-# window/session seam: launching the same PR twice always finds the one session. nvim/claude
-# launch as each pane's DIRECT command (not send-keys, which races shell startup); panes are
-# targeted by captured pane-id (immune to pane-base-index).
-create() {
-    local main_pane
-    main_pane=$(tmux new-session -d -s "$window" -n "$window" -c "$repo_dir" \
-        -P -F '#{pane_id}' nvim -c "PrReviewStart ${url}")
-    tmux split-window -v -l 30% -t "$main_pane" -c "$repo_dir" claude "/peer-review ${url}"
-    tmux select-pane -t "$main_pane"
-}
-
-tmux has-session -t="$window" 2>/dev/null || create
-if [[ -z ${TMUX:-} ]]; then
-    tmux attach-session -t="$window" # launched outside tmux: attach into the session
-else
-    tmux switch-client -t="$window"  # launched inside tmux: add the session and switch to it
-fi
+exec nvim -c "PrReviewStart $1"

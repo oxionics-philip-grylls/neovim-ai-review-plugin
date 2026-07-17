@@ -89,6 +89,7 @@ describe("ai-review end-to-end", function()
       confirm = vim.fn.confirm,
       gh_run = gh.run,
       default_root = state.default_root,
+      chan_send = vim.api.nvim_chan_send,
     }
     troot = vim.fn.tempname()
     state.default_root = function()
@@ -108,7 +109,7 @@ describe("ai-review end-to-end", function()
     if orig_cwd then
       vim.cmd.cd(orig_cwd)
     end
-    url.parse_remote, gh.pr_info, gh.run, diff.cursor_anchor, vim.ui.input, vim.ui.select, vim.fn.confirm, state.default_root =
+    url.parse_remote, gh.pr_info, gh.run, diff.cursor_anchor, vim.ui.input, vim.ui.select, vim.fn.confirm, state.default_root, vim.api.nvim_chan_send =
       saved.parse_remote,
       saved.pr_info,
       saved.gh_run,
@@ -116,7 +117,9 @@ describe("ai-review end-to-end", function()
       saved.ui_input,
       saved.ui_select,
       saved.confirm,
-      saved.default_root
+      saved.default_root,
+      saved.chan_send
+    require("ai-review")._claude = nil -- clear any fake terminal a test set
     vim.fn.delete(root, "rf")
     vim.fn.delete(troot, "rf")
   end)
@@ -884,7 +887,7 @@ describe("ai-review end-to-end", function()
     close_diffview_and_wait()
   end)
 
-  it("submit 'Let Claude write it' nudges the pane and posts nothing", function()
+  it("submit 'Let Claude write it' chansends the Claude terminal and posts nothing", function()
     pr.start("https://github.com/test/repo/pull/1")
     local prkey = { owner = "test", repo = "repo", number = 1 }
     local b = state.load_or_init_batch(prkey)
@@ -898,6 +901,9 @@ describe("ai-review end-to-end", function()
       body = "note",
     })
     state.save_batch(b)
+    -- no snacks on the test rtp, so start() never populates pr._claude; fake a live
+    -- terminal job here to exercise the chansend branch.
+    pr._claude = { win = nil, buf = 1, job = 99 }
     local posts, sent = 0, nil
     local real_run = gh.run
     gh.run = function(cmd)
@@ -905,14 +911,11 @@ describe("ai-review end-to-end", function()
         posts = posts + 1
         return { code = 0, stdout = "{}", stderr = "" }
       end
-      if cmd[1] == "tmux" and cmd[2] == "list-panes" then
-        return { code = 0, stdout = "%1 nvim\n%2 claude\n", stderr = "" }
-      end
-      if cmd[1] == "tmux" and cmd[2] == "send-keys" then
-        sent = cmd
-        return { code = 0, stdout = "", stderr = "" }
-      end
       return real_run(cmd)
+    end
+    -- stub restored + pr._claude cleared in after_each (so a failed assert can't leak them)
+    vim.api.nvim_chan_send = function(chan, data)
+      sent = { chan = chan, data = data }
     end
     vim.ui.select = function(_, opts, cb)
       if opts.prompt == "Empty review body:" then
@@ -923,8 +926,10 @@ describe("ai-review end-to-end", function()
     end
     pr.submit()
     assert.are.equal(0, posts)
-    assert.is_not_nil(sent) -- a send-keys nudge fired at the claude pane
-    assert.are.equal("%2", sent[4])
+    assert.is_not_nil(sent) -- a chansend nudge fired at the claude terminal
+    assert.are.equal(99, sent.chan)
+    assert.is_truthy(sent.data:find("summary body", 1, true)) -- the body request, not some other message
+    assert.is_truthy(sent.data:find("\r", 1, true)) -- with the Enter that submits it to Claude
     close_diffview_and_wait()
   end)
 
