@@ -54,7 +54,86 @@ local function open_review_tree()
     if #(snacks.picker.get({ source = "explorer" }) or {}) > 0 then
       return
     end
-    M._review_tree = snacks.explorer({ layout = { layout = { position = "right" } } })
+    -- Open files in a vsplit, not the picker's heuristic "main" window — during a review
+    -- that main window is usually a diff pane, so a plain <CR> would clobber the diff.
+    M._review_tree = snacks.explorer({
+      layout = { layout = { position = "right" } },
+      win = {
+        list = {
+          keys = {
+            ["<CR>"] = "edit_vsplit",
+            ["l"] = "edit_vsplit",
+            ["<2-LeftMouse>"] = "edit_vsplit",
+          },
+        },
+      },
+    })
+  end)
+end
+
+--- Strip scrollbind/cursorbind from every non-diff window in the review tab, then re-sync
+--- the diff pair. The snacks tree (and any file opened via a split) is created FROM a diff
+--- window, so Vim copies those options onto it — it silently joins the diff panes' scroll
+--- group and desyncs them. All pcall-guarded (diffview internals; no-op on any failure).
+function M._guard_scrollbind()
+  local ok, lib = pcall(require, "diffview.lib")
+  if not ok then
+    return
+  end
+  pcall(function()
+    local view = lib.get_current_view()
+    if not (view and view.cur_layout and view.cur_layout.windows) then
+      return
+    end
+    local is_diff, diffs_valid = {}, true
+    for _, w in ipairs(view.cur_layout.windows) do
+      if w.id then
+        is_diff[w.id] = true
+        if not vim.api.nvim_win_is_valid(w.id) then
+          diffs_valid = false
+        end
+      end
+    end
+    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+      if not is_diff[win] and vim.api.nvim_win_is_valid(win) then
+        pcall(function()
+          vim.wo[win].scrollbind = false
+          vim.wo[win].cursorbind = false
+        end)
+      end
+    end
+    -- skip the re-sync when the diff windows are gone (e.g. right after close_diffs):
+    -- sync_scroll would throw on the stale ids — harmless under pcall, but pointless.
+    if diffs_valid and type(view.cur_layout.sync_scroll) == "function" then
+      pcall(function()
+        view.cur_layout:sync_scroll()
+      end)
+    end
+  end)
+end
+
+--- Close just the diff windows, leaving diffview's file panel open, so you can pick
+--- another file from the tree — diffview recreates the diffs on select (ensure_layout).
+--- This is the "close this diff, keep browsing" that plain :DiffviewClose isn't.
+function M.close_diffs()
+  local ok, lib = pcall(require, "diffview.lib")
+  if not ok then
+    return
+  end
+  pcall(function()
+    local view = lib.get_current_view()
+    if not (view and view.cur_layout and view.cur_layout.windows) then
+      return
+    end
+    for _, w in ipairs(view.cur_layout.windows) do
+      if w.id and vim.api.nvim_win_is_valid(w.id) then
+        pcall(vim.api.nvim_win_close, w.id, false)
+      end
+    end
+    -- land the cursor in the panel so the next file pick (which reopens the diffs) is one keystroke away
+    if view.panel and view.panel.winid then
+      pcall(vim.api.nvim_set_current_win, view.panel.winid)
+    end
   end)
 end
 
@@ -255,8 +334,7 @@ function M.start(arg)
   if not vim.uv.fs_stat(state.batch_path(pr)) then
     state.save_batch(batch.new(pr))
   end
-  diff.open(pr.base)
-  open_review_tree() -- normal file tree on the right, beside the diff panel
+  diff.open(pr.base) -- the review tree opens on DiffviewViewOpened (post-layout), not here
   overlay.refresh(pr)
   -- Watch the batch file: when Claude (peer-review) flips draft→verified and writes it
   -- back, re-render so the flip shows without the human doing anything.
@@ -304,6 +382,9 @@ function M.start(arg)
       vim.keymap.set("n", "<leader>re", "<cmd>PrSuggest<cr>", { buffer = 0, desc = "PR: edit on branch to suggest" })
       vim.keymap.set("n", "R", "<cmd>PrReviewed<cr>", { buffer = 0, desc = "PR: toggle file reviewed" })
       vim.keymap.set("n", "gO", "<cmd>PrGoto<cr>", { buffer = 0, desc = "PR: open real file here (LSP nav)" })
+      -- `q` in a diff closes just the diff windows, keeping diffview's panel so you can
+      -- open another file from it (overrides diffview's own view `q`=DiffviewClose here).
+      vim.keymap.set("n", "q", M.close_diffs, { buffer = 0, desc = "PR: close diffs, keep the panel" })
     end,
   })
   vim.api.nvim_create_autocmd("BufWritePost", {
@@ -833,6 +914,7 @@ function M.setup(opts)
     callback = function()
       if current_pr then
         panel.attach(current_pr)
+        open_review_tree() -- post-layout, so it doesn't race diffview's window setup
       end
     end,
   })
@@ -841,6 +923,17 @@ function M.setup(opts)
     pattern = "DiffviewViewClosed",
     callback = function()
       panel.detach()
+    end,
+  })
+  -- Foreign windows (the snacks tree, split-opened files) inherit scrollbind from the
+  -- diff window they're spawned off and desync the diff panes; re-clean on any window
+  -- appearing/closing in the review tab. Gated on an active review + guarded internally.
+  vim.api.nvim_create_autocmd({ "WinNew", "WinClosed" }, {
+    group = augroup,
+    callback = function()
+      if current_pr then
+        vim.schedule(M._guard_scrollbind)
+      end
     end,
   })
   -- `clear = true` above already makes re-running setup() idempotent for the group;
