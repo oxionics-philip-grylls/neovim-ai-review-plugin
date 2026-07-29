@@ -120,6 +120,7 @@ describe("ai-review end-to-end", function()
       saved.default_root,
       saved.chan_send
     require("ai-review")._claude = nil -- clear any fake terminal a test set
+    package.loaded.snacks = nil -- drop any fake snacks a test injected (real snacks isn't on the test rtp)
     vim.fn.delete(root, "rf")
     vim.fn.delete(troot, "rf")
   end)
@@ -930,6 +931,86 @@ describe("ai-review end-to-end", function()
     assert.are.equal(99, sent.chan)
     assert.is_truthy(sent.data:find("summary body", 1, true)) -- the body request, not some other message
     assert.is_truthy(sent.data:find("\r", 1, true)) -- with the Enter that submits it to Claude
+    close_diffview_and_wait()
+  end)
+
+  -- Start a review with snacks stubbed out, capturing how we handed the terminal to
+  -- Claude (the opts, and the tabpage we were on when we asked for it).
+  local function claude_spawn()
+    local got = {}
+    package.loaded.snacks = { -- stub restored in after_each
+      terminal = {
+        open = function(_, o)
+          got.opts = o
+          got.tab = vim.api.nvim_get_current_tabpage()
+          got.buf = vim.api.nvim_create_buf(false, true)
+          return { buf = got.buf, close = function() end }
+        end,
+      },
+      picker = {
+        get = function() -- open_review_tree also requires snacks
+          return {}
+        end,
+      },
+    }
+    pr.start("https://github.com/test/repo/pull/1")
+    assert.is_not_nil(got.opts)
+    return got
+  end
+
+  it("opens the Claude terminal so that entering the pane can scroll it", function()
+    -- Claude's TUI runs on the alternate screen and grabs the mouse, so it owns its
+    -- scrollback: the wheel only reaches it while the window is in terminal-mode, and
+    -- nvim's own buffer has nothing to scroll. Hence auto_insert — without it every
+    -- click into the pane lands in normal mode and scrolling is silently dead.
+    -- start_insert/enter stay false so opening a review doesn't yank focus off the diff.
+    local opts = claude_spawn().opts
+    assert.is_true(opts.auto_insert)
+    assert.is_false(opts.start_insert)
+    close_diffview_and_wait()
+  end)
+
+  it("puts Claude in its own tab and leaves you on the diff", function()
+    -- nvim redraws visible windows on terminal output, and those redraws tear down
+    -- cmdline completion popups. A background tab isn't drawn, so Claude costs nothing
+    -- while you review. Leaving focus on the diff is the point of doing it this way.
+    local got = claude_spawn()
+    assert.are.equal("current", got.opts.win.position) -- fills its tab rather than splitting one
+    local landed = vim.api.nvim_get_current_tabpage()
+    assert.are_not.equal(got.tab, landed) -- Claude is somewhere else
+    assert.is_true(vim.api.nvim_tabpage_is_valid(got.tab)) -- and still open
+    assert.is_not_nil(require("diffview.lib").get_current_view()) -- we're on the review tab
+    close_diffview_and_wait()
+  end)
+
+  it(":PrClaude focuses the Claude tab, and warns when there's no session", function()
+    local got = claude_spawn()
+    pr.claude()
+    assert.are.equal(got.tab, vim.api.nvim_get_current_tabpage())
+    close_diffview_and_wait()
+
+    pr._claude = nil
+    local warned
+    local real_notify = vim.notify
+    vim.notify = function(msg, lvl)
+      warned = { msg = msg, lvl = lvl }
+    end
+    pr.claude()
+    vim.notify = real_notify
+    assert.is_truthy(warned and warned.msg:find("no Claude session", 1, true))
+    assert.are.equal(vim.log.levels.WARN, warned.lvl)
+  end)
+
+  it("hides $TMUX from Claude so its clipboard writes don't corrupt the pane", function()
+    -- When Claude sees $TMUX it wraps clipboard writes in a tmux DCS passthrough
+    -- (ESC P tmux; ...). nvim's terminal emulator can't parse that and renders the
+    -- base64 payload as literal text at the cursor — i.e. into Claude's own prompt.
+    -- Blanking it makes Claude emit plain OSC 52, which nvim handles correctly.
+    -- Empty string (not nil) because jobstart's env extends rather than removes; Claude
+    -- treats blank as absent. Only these two keys, so PATH/HOME/auth still inherit.
+    local opts = claude_spawn().opts
+    assert.are.equal("", opts.env.TMUX)
+    assert.are.equal("", opts.env.TMUX_PANE)
     close_diffview_and_wait()
   end)
 

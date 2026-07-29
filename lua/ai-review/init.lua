@@ -87,9 +87,19 @@ local function open_review_tree()
   end)
 end
 
---- Spawn the Claude /peer-review session as a bottom-split terminal we own, capturing its
---- channel for chansend nudges. No-op without snacks (headless tests). enter=false so it
---- doesn't steal focus from the diff.
+--- Spawn the Claude /peer-review session as a terminal we own in its OWN TAB, capturing
+--- its channel for chansend nudges. No-op without snacks (headless tests).
+---
+--- Own tab, not a split in the review tab: nvim redraws every visible window when a
+--- terminal job emits output, and those redraws tear down command-line completion
+--- popups (confirmed independent of noice — it flickers with noice disabled too).
+--- A terminal in a background tab isn't drawn, so it costs nothing while you review.
+--- Focus returns to the review tab; :PrClaude jumps to Claude.
+---
+--- auto_insert: Claude's TUI runs on the alternate screen and grabs the mouse, so it owns
+--- its scrollback — nvim's terminal buffer has nothing to scroll, and the wheel only
+--- reaches Claude while the window is in terminal-mode. Without this, entering the pane
+--- lands in normal mode and both scrolling and Claude's own drag-select are dead.
 ---@param pr_url string
 local function open_claude(pr_url)
   M._close_claude() -- a restart without :PrReviewClose would otherwise orphan the old job+window
@@ -98,17 +108,37 @@ local function open_claude(pr_url)
     return
   end
   pcall(function()
+    local review_tab = vim.api.nvim_get_current_tabpage()
+    vim.cmd("tabnew")
     local term = snacks.terminal.open(('claude "/peer-review %s"'):format(pr_url), {
       cwd = vim.uv.cwd(),
+      -- Blank $TMUX: nvim usually runs inside tmux, and an inherited $TMUX makes Claude
+      -- wrap clipboard writes in a tmux DCS passthrough that nvim's terminal can't parse,
+      -- so the base64 payload renders as literal text into Claude's own prompt. Blank
+      -- rather than removed (jobstart's env extends, it can't unset); Claude reads blank
+      -- as absent and falls back to plain OSC 52, which nvim honours.
+      env = { TMUX = "", TMUX_PANE = "" },
       start_insert = false,
-      auto_insert = false,
-      win = { position = "bottom", enter = false },
+      auto_insert = true,
+      win = { position = "current" }, -- fill the tab we just made, don't split it
     })
     local buf = term and term.buf
     if not buf then
+      -- don't strand the user on the empty scratch tab we opened for a terminal that never came
+      pcall(vim.cmd, "tabclose")
+      pcall(vim.api.nvim_set_current_tabpage, review_tab)
       return
     end
-    M._claude = { win = term, buf = buf, job = vim.b[buf].terminal_job_id }
+    M._claude = {
+      win = term,
+      buf = buf,
+      tab = vim.api.nvim_get_current_tabpage(),
+      job = vim.b[buf].terminal_job_id,
+    }
+    -- back to the diff: the review is what you drive, Claude just runs
+    if vim.api.nvim_tabpage_is_valid(review_tab) then
+      pcall(vim.api.nvim_set_current_tabpage, review_tab)
+    end
     if not M._claude.job then
       -- terminal_job_id can lag the open by a tick; grab it on the next loop
       vim.defer_fn(function()
@@ -118,6 +148,16 @@ local function open_claude(pr_url)
       end, 50)
     end
   end)
+end
+
+--- Jump to the Claude tab. Claude lives off-screen (see open_claude), so this is how you
+--- go look at it; it never spawns a session, only focuses one that's already running.
+function M.claude()
+  if not (M._claude and M._claude.tab and vim.api.nvim_tabpage_is_valid(M._claude.tab)) then
+    vim.notify("prreview: no Claude session (:PrReviewStart starts one)", vim.log.levels.WARN)
+    return
+  end
+  vim.api.nvim_set_current_tabpage(M._claude.tab)
 end
 
 --- Strip scrollbind/cursorbind from every non-diff window in the review tab, then re-sync
@@ -893,6 +933,7 @@ function M.setup(opts)
   vim.api.nvim_create_user_command("PrGoto", M.goto_file, {})
   vim.api.nvim_create_user_command("PrBody", M.body, {})
   vim.api.nvim_create_user_command("PrComments", M.comments, {})
+  vim.api.nvim_create_user_command("PrClaude", M.claude, {})
   vim.api.nvim_create_user_command("PrReviewed", M.toggle_reviewed, {})
   vim.api.nvim_create_user_command("PrReviewRefresh", function()
     if current_pr then
