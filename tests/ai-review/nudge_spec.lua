@@ -61,4 +61,13 @@ describe("ai-review.nudge.make", function()
     pending() -- one deferred fire
     assert.are.equal(1, sent)
   end)
+
+  it("builds a re-anchor request naming the batch and the narrow contract", function()
+    local msg = nudge.reanchor_request_msg("/tmp/b.json")
+    assert.is_truthy(msg:find("/tmp/b.json", 1, true))
+    assert.is_truthy(msg:lower():find("re%-anchor"))
+    -- the contract must be explicit in the message: anchors only
+    assert.is_truthy(msg:find("body", 1, true))
+    assert.is_truthy(msg:find("verdict", 1, true))
+  end)
 end)

@@ -2,17 +2,6 @@
 
 local M = {}
 
---- The message to send to the claude pane when the user asks Claude to author the
---- review summary body. `batch_path` tells the /peer-review skill which batch to edit.
----@param batch_path string
----@return string
-function M.body_request_msg(batch_path)
-  return (
-    "prreview: please author the review summary body (overall assessment + reasoning) "
-    .. "into the batch's `body` field at %s, then tell me it's ready"
-  ):format(batch_path)
-end
-
 --- Build a debounced nudger. `request()` arms a single trailing timer; further requests
 --- while armed coalesce. On fire: if there are drafts, send the message (send() itself
 --- no-ops when Claude isn't reachable).
@@ -35,6 +24,20 @@ function M.make(opts)
       opts.schedule(opts.delay_ms, fire)
     end,
   }
+end
+
+--- The message asking Claude to re-anchor the batch before it's posted. The contract is
+--- deliberately narrow — anchors only — because the sheet the human just edited is the
+--- source of truth for everything else.
+---@param batch_path string
+---@return string
+function M.reanchor_request_msg(batch_path)
+  return (
+    "prreview: I've finished editing the review sheet. Please re-anchor the batch at %s: "
+    .. "for every entry confirm `path`/`line`/`start_line`/`side` still identify the intended "
+    .. "code on the PR head and fix them where they drifted. Do NOT change any `body`, the "
+    .. "`verdict`, or the set of ids. Write the batch back and tell me it's ready."
+  ):format(batch_path)
 end
 
 return M

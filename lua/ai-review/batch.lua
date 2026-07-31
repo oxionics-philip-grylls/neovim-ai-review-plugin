@@ -40,16 +40,20 @@ local M = {}
 ---@param pr prreview.PR
 ---@return prreview.Batch
 function M.new(pr)
-  return { pr = pr, verdict = nil, body = "", comments = {}, next_id = 1, reviewed = {} }
+  -- "COMMENT", not nil: the review sheet renders a `# verdict:` line for the human to change,
+  -- and that line must not be a fiction. serialize maps verdict onto the API's `event`, and a
+  -- POST with no event files a PENDING review — which looks submitted to its author and is
+  -- invisible to everyone else. COMMENT is the non-committal verdict, so defaulting to it
+  -- claims nothing on the human's behalf.
+  return { pr = pr, verdict = "COMMENT", body = "", comments = {}, next_id = 1, reviewed = {} }
 end
 
+--- Allocate the next `c<N>` id, seeding the counter from existing entries for legacy
+--- batches decoded from a file that predates the persistent counter.
 ---@param b prreview.Batch
----@param entry prreview.Comment
 ---@return string id
-function M.add(b, entry)
+function M.alloc_id(b)
   if b.next_id == nil then
-    -- legacy batch decoded from a file predating the persistent counter: seed it from
-    -- the current max so we don't collide with existing entries
     local max = 0
     for _, c in ipairs(b.comments) do
       local n = tonumber(tostring(c.id or ""):match("^c(%d+)$") or "")
@@ -59,8 +63,16 @@ function M.add(b, entry)
     end
     b.next_id = max + 1
   end
-  entry.id = "c" .. b.next_id
+  local id = "c" .. b.next_id
   b.next_id = b.next_id + 1
+  return id
+end
+
+---@param b prreview.Batch
+---@param entry prreview.Comment
+---@return string id
+function M.add(b, entry)
+  entry.id = M.alloc_id(b)
   b.comments[#b.comments + 1] = entry
   return entry.id
 end

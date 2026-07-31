@@ -7,7 +7,19 @@ describe("ai-review.batch", function()
     local b = batch.new(pr)
     assert.are.same(pr, b.pr)
     assert.are.equal(0, #b.comments)
-    assert.is_nil(b.verdict)
+    -- the non-committal verdict, not nil: nil serializes to no `event`, which GitHub files
+    -- as a PENDING review instead of a posted one
+    assert.are.equal("COMMENT", b.verdict)
+  end)
+
+  it("alloc_id hands out sequential c<N> ids and seeds from legacy batches", function()
+    local b = batch.new(pr)
+    assert.are.equal("c1", batch.alloc_id(b))
+    assert.are.equal("c2", batch.alloc_id(b))
+    local legacy = batch.new(pr)
+    legacy.next_id = nil
+    legacy.comments = { { id = "c7" } }
+    assert.are.equal("c8", batch.alloc_id(legacy))
   end)
 
   it("adds entries with sequential ids and counts drafts", function()

@@ -8,6 +8,7 @@ local diff = require("ai-review.diff")
 local overlay = require("ai-review.overlay")
 local nudge = require("ai-review.nudge")
 local panel = require("ai-review.panel")
+local sheet = require("ai-review.sheet")
 
 local M = {}
 ---@type prreview.PR?
@@ -20,6 +21,12 @@ M._review_tree = nil
 -- The Claude /peer-review session, run as a plugin-owned snacks terminal (bottom split).
 -- job is its channel — nudges are nvim_chan_send'd straight to Claude's stdin.
 M._claude = nil ---@type { win: any, buf: integer, job: integer }|nil
+-- The review sheet: the batch as one editable document in its own tab, code pane beside it.
+---@type { buf: integer, tab: integer, code_win: integer, sheet_win: integer, pr: prreview.PR, last_anchor: { path: string, line: integer }?, prior_submitted_at: string? }|nil
+M._sheet = nil
+-- One-shot watcher armed while the sheet POST waits for Claude to write the batch back.
+---@type uv.uv_fs_event_t?
+M._sheet_wait = nil
 
 --- Stop the batch fs-watcher (idempotent).
 function M._stop_watch()
@@ -29,6 +36,20 @@ function M._stop_watch()
       M._watch:close()
     end)
     M._watch = nil
+  end
+end
+
+--- Stop the sheet POST's one-shot re-anchor watcher (idempotent). Kept beside _stop_watch
+--- because it carries the same hazard: a watcher outliving what it was waiting for is how
+--- the confirm-then-post flow gets re-entered at a moment nobody asked for, so every
+--- teardown path has to come through here.
+function M._stop_sheet_wait()
+  if M._sheet_wait then
+    pcall(function()
+      M._sheet_wait:stop()
+      M._sheet_wait:close()
+    end)
+    M._sheet_wait = nil
   end
 end
 
@@ -53,6 +74,36 @@ function M._close_claude()
     end
     M._claude = nil
   end
+end
+
+--- Close the review sheet's tab, if we opened one (idempotent, pcall-guarded). The sheet
+--- buffer is bufhidden=wipe, so closing its tab already disposes of the buffer and fires
+--- BufWipeout (which clears M._sheet) — this just forces that from outside the sheet's own
+--- UI, e.g. on :PrReviewClose, so a stale sheet from a closed review can't linger.
+---
+--- Never silently discards unsaved edits: a teardown path (:PrReviewClose, VimLeavePre,
+--- M.sheet() replacing a stale sheet) must not be interactive or block on a prompt, and
+--- must not attempt an auto-save (a parse failure there would have nowhere to surface),
+--- so an unsaved buffer just gets a clear notify naming the batch path before closing —
+--- the human can reopen :PrReviewSheet and re-apply from memory, but at least isn't left
+--- wondering where the edits went.
+function M._close_sheet()
+  M._stop_sheet_wait() -- a sheet being torn down can't still be waiting on a re-anchor
+  if M._sheet and vim.api.nvim_tabpage_is_valid(M._sheet.tab) then
+    if vim.api.nvim_buf_is_valid(M._sheet.buf) and vim.bo[M._sheet.buf].modified then
+      vim.notify(
+        "prreview: closed the review sheet with unsaved edits — they were discarded ("
+          .. state.batch_path(M._sheet.pr)
+          .. " was not changed)",
+        vim.log.levels.WARN
+      )
+    end
+    pcall(function()
+      vim.api.nvim_set_current_tabpage(M._sheet.tab)
+      vim.cmd("tabclose!")
+    end)
+  end
+  M._sheet = nil
 end
 
 --- Open a normal file tree on the RIGHT for the review, alongside diffview's diff panel.
@@ -90,11 +141,11 @@ end
 --- Spawn the Claude /peer-review session as a terminal we own in its OWN TAB, capturing
 --- its channel for chansend nudges. No-op without snacks (headless tests).
 ---
---- Own tab, not a split in the review tab: nvim redraws every visible window when a
---- terminal job emits output, and those redraws tear down command-line completion
---- popups (confirmed independent of noice — it flickers with noice disabled too).
---- A terminal in a background tab isn't drawn, so it costs nothing while you review.
---- Focus returns to the review tab; :PrClaude jumps to Claude.
+--- Own tab, not a split in the review tab: it keeps the review layout to the diff and the
+--- tree, which is what we want anyway. It was ALSO an attempt to stop the terminal's output
+--- disturbing command-line completion popups — that did NOT work; the flicker persists from
+--- a background tab, so don't credit this layout with fixing it. (Not noice either — it
+--- flickers with noice disabled.) Focus returns to the review tab; :PrClaude jumps to Claude.
 ---
 --- auto_insert: Claude's TUI runs on the alternate screen and grabs the mouse, so it owns
 --- its scrollback — nvim's terminal buffer has nothing to scroll, and the wheel only
@@ -129,6 +180,13 @@ local function open_claude(pr_url)
       pcall(vim.api.nvim_set_current_tabpage, review_tab)
       return
     end
+    -- winfixbuf: Claude fills its whole tab, so anything that opens a buffer in the current
+    -- window (clicking a file in the tabline, an LSP jump, a quickfix entry) would swap the
+    -- terminal out. The job keeps running but is displayed nowhere, which strands the user
+    -- with no window to return to. Refusing the swap (E1513) is far kinder than that.
+    pcall(function()
+      vim.wo[vim.api.nvim_get_current_win()].winfixbuf = true
+    end)
     M._claude = {
       win = term,
       buf = buf,
@@ -158,13 +216,38 @@ function M.claude()
     return
   end
   vim.api.nvim_set_current_tabpage(M._claude.tab)
+  if not vim.api.nvim_buf_is_valid(M._claude.buf) then
+    vim.notify("prreview: the Claude terminal buffer is gone — :PrReviewStart to restart", vim.log.levels.WARN)
+    return
+  end
+  -- Recovery: winfixbuf refuses most evictions, but a closed window or a plugin that sets the
+  -- buffer another way can still leave the job running with nothing showing it. Put it back
+  -- rather than leaving the tab stuck on whatever replaced it.
+  if #vim.fn.win_findbuf(M._claude.buf) == 0 then
+    local win = vim.api.nvim_get_current_win()
+    pcall(function()
+      vim.wo[win].winfixbuf = false -- else the restore is refused by our own guard
+    end)
+    pcall(vim.api.nvim_win_set_buf, win, M._claude.buf)
+    pcall(function()
+      vim.wo[win].winfixbuf = true
+    end)
+  end
 end
 
---- Strip scrollbind/cursorbind from every non-diff window in the review tab, then re-sync
+--- Strip scrollbind/cursorbind from every non-diff SPLIT in the review tab, then re-sync
 --- the diff pair. The snacks tree (and any file opened via a split) is created FROM a diff
 --- window, so Vim copies those options onto it — it silently joins the diff panes' scroll
 --- group and desyncs them. All pcall-guarded (diffview internals; no-op on any failure).
+---
+--- Bails while the cmdline is open. A completion popup is a floating WINDOW, so it fires the
+--- WinNew that schedules this, and running here dismissed the popup on every keystroke — the
+--- diff panes cannot desync from a menu that lives for one character anyway. Floats are also
+--- skipped below: they never inherit scrollbind from the split they were opened over.
 function M._guard_scrollbind()
+  if vim.fn.getcmdtype() ~= "" then
+    return
+  end
   local ok, lib = pcall(require, "diffview.lib")
   if not ok then
     return
@@ -184,7 +267,8 @@ function M._guard_scrollbind()
       end
     end
     for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
-      if not is_diff[win] and vim.api.nvim_win_is_valid(win) then
+      local floating = vim.api.nvim_win_get_config(win).relative ~= ""
+      if not is_diff[win] and not floating and vim.api.nvim_win_is_valid(win) then
         pcall(function()
           vim.wo[win].scrollbind = false
           vim.wo[win].cursorbind = false
@@ -806,6 +890,438 @@ local function parse_review_id(stdout)
   return nil
 end
 
+local VALID_VERDICTS = { APPROVE = true, COMMENT = true, REQUEST_CHANGES = true }
+
+--- Guard the one field GitHub silently reinterprets: a reviews POST with no `event` creates
+--- a PENDING review, which looks submitted to its author and is invisible to everyone else.
+--- Refuse instead, naming the sheet line that fixes it. batch.new now defaults the verdict to
+--- COMMENT, so this only trips on a batch written by an older version or another tool.
+---@param b prreview.Batch
+---@return boolean ok
+local function verdict_ok(b)
+  if VALID_VERDICTS[b.verdict or ""] then
+    return true
+  end
+  vim.notify(
+    "prreview: not posted — the batch's verdict is missing or invalid; set the sheet's "
+      .. "`# verdict:` line to APPROVE / COMMENT / REQUEST_CHANGES and :w it",
+    vim.log.levels.ERROR
+  )
+  return false
+end
+
+--- Serialize the batch and POST it. Re-reads from disk so a verify-flip or a re-anchor that
+--- landed while the sheet was open is included, and bails if another submit beat us to it.
+--- The single route to `gh api`: every caller must already have taken an explicit confirm.
+---@param pr_ prreview.PR
+---@param prior_submitted_at string? the marker seen when this post flow began, if any
+local function post_batch(pr_, prior_submitted_at)
+  local b = state.load_or_init_batch(pr_)
+  -- Only bail on a submitted_at that APPEARED since this flow began (a concurrent submit) —
+  -- not on one the user already knowingly confirmed past.
+  if b.submitted_at and b.submitted_at ~= prior_submitted_at then
+    vim.notify("prreview: submit cancelled (already submitted at " .. b.submitted_at .. ")", vim.log.levels.WARN)
+    return
+  end
+  if not verdict_ok(b) then
+    return
+  end
+  local serialized = batch.serialize(b)
+  if #serialized.comments == 0 and (not serialized.body or serialized.body == "") then
+    vim.notify("prreview: nothing to submit", vim.log.levels.WARN)
+    return
+  end
+  local tmp = vim.fn.tempname()
+  local fd = assert(io.open(tmp, "w"))
+  fd:write(vim.json.encode(serialized))
+  fd:close()
+  local r = gh.run(gh.post_review_cmd(pr_.owner, pr_.repo, pr_.number, tmp))
+  if r.code == 0 then
+    b.submitted_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
+    b.submitted_review = parse_review_id(r.stdout)
+    state.save_batch(b)
+    vim.notify("prreview: review posted")
+  else
+    vim.notify("prreview: post failed: " .. r.stderr, vim.log.levels.ERROR)
+  end
+  vim.fn.delete(tmp) -- review JSON can carry code snippets; don't leave it in tmp
+end
+
+--- Point the sheet's code pane at the entry under the cursor. Best-effort: a comment can
+--- name a path that no longer exists on the branch, and that must not break the sheet.
+---
+--- `anchor_at` returns the SAME anchor for every line inside one comment's body, so an
+--- ordinary cursor move while editing a comment (not switching entries) would otherwise
+--- re-trigger a full `:edit` + re-center on every keystroke, stomping any manual scrolling
+--- in the code pane. `s.last_anchor` caches the anchor last synced to; re-sync only fires
+--- when it actually changes. A fresh sheet has no `last_anchor` yet, so its first move
+--- always syncs once, per spec ("moving in the sheet scrolls... to that comment's anchor").
+local function sync_code_pane()
+  local s = M._sheet
+  if
+    not (
+      s
+      and vim.api.nvim_win_is_valid(s.code_win)
+      and vim.api.nvim_win_is_valid(s.sheet_win)
+      and vim.api.nvim_buf_is_valid(s.buf)
+    )
+  then
+    return
+  end
+  local lnum = vim.api.nvim_win_get_cursor(s.sheet_win)[1]
+  local anchor = sheet.anchor_at(vim.api.nvim_buf_get_lines(s.buf, 0, -1, false), lnum)
+  if not anchor then
+    return
+  end
+  if s.last_anchor and s.last_anchor.path == anchor.path and s.last_anchor.line == anchor.line then
+    return
+  end
+  s.last_anchor = anchor
+  local wt = s.pr.worktree or state.worktree_path(s.pr)
+  local path = wt .. "/" .. anchor.path
+  if not vim.uv.fs_stat(path) then
+    return
+  end
+  pcall(function()
+    vim.api.nvim_win_call(s.code_win, function()
+      vim.cmd("edit " .. vim.fn.fnameescape(path))
+      pcall(vim.api.nvim_win_set_cursor, s.code_win, { anchor.line, 0 })
+      vim.cmd("normal! zz")
+    end)
+  end)
+end
+
+--- Record the mtime of a batch write WE just made. The re-anchor watcher is filtered to the
+--- batch file, so without this a `:w` in the sheet during the wait fires it and produces a
+--- post confirm byte-identical to the real one — consent for a re-anchor that never happened.
+---@param s table the live M._sheet
+local function mark_self_write(s)
+  local st = vim.uv.fs_stat(state.batch_path(s.pr))
+  s.self_write_mtime = st and st.mtime or nil
+end
+
+--- Parse the sheet buffer and fold it into the batch. Returns false (and notifies) on any
+--- parse or apply failure, leaving the batch on disk untouched.
+---
+--- Drops accumulate on `M._sheet.dropped` rather than being reported only here: this notify
+--- is transient, and on the path the spec worries about (a deleted section silently deleting
+--- a comment) the very next thing on screen is a modal confirm that takes over the message
+--- area. The POST confirm names the total, and clears it once the sheet has been re-rendered.
+---@return boolean ok, integer? dropped
+local function save_sheet()
+  local s = M._sheet
+  if not s then
+    return false
+  end
+  local parsed, perr = sheet.parse(vim.api.nvim_buf_get_lines(s.buf, 0, -1, false))
+  if not parsed then
+    vim.notify("prreview: sheet not saved — " .. perr, vim.log.levels.ERROR)
+    return false
+  end
+  local b = state.load_or_init_batch(s.pr)
+  local dropped, aerr = sheet.apply(b, parsed)
+  if aerr then
+    vim.notify("prreview: sheet not saved — " .. aerr, vim.log.levels.ERROR)
+    return false
+  end
+  state.save_batch(b)
+  mark_self_write(s)
+  s.dropped = (s.dropped or 0) + dropped
+  vim.bo[s.buf].modified = false
+  vim.notify(("prreview: sheet saved (%d comments, %d dropped)"):format(#b.comments, dropped))
+  return true, dropped
+end
+
+--- Second half of the sheet POST: Claude has re-anchored (or we're posting without it).
+--- Re-render first, so the anchors the human confirms are the ones about to be published.
+function M._sheet_reanchored()
+  -- Unconditionally, before anything else: whatever the wait was for has now happened (or
+  -- been overtaken by hand), so neither the watcher nor its timeout may outlive this call.
+  M._stop_sheet_wait()
+  local s = M._sheet
+  if not (s and vim.api.nvim_buf_is_valid(s.buf)) then
+    return -- no sheet to show the anchors in; showing them IS the confirm, so don't post
+  end
+  local b = state.load_or_init_batch(s.pr)
+  if vim.bo[s.buf].modified then
+    -- Edits made during the wait were never folded into the batch, so they were never going
+    -- to post; the re-render drops them. Say so, same as _close_sheet does.
+    vim.notify("prreview: unsaved sheet edits were discarded by the re-anchor re-render", vim.log.levels.WARN)
+  end
+  vim.api.nvim_buf_set_lines(s.buf, 0, -1, false, sheet.render(b))
+  vim.bo[s.buf].modified = false
+  if not verdict_ok(b) then
+    return
+  end
+  local verified, drafts = 0, 0
+  for _, c in ipairs(b.comments or {}) do
+    if c.status == "verified" then
+      verified = verified + 1
+    else
+      drafts = drafts + 1
+    end
+  end
+  -- Everything the human needs to judge the post goes in the one prompt: only verified
+  -- entries post, so an unnoticed draft or a section deleted from the sheet would otherwise
+  -- vanish silently. The re-render above resynced sheet and batch, so the running drop
+  -- total is reported once here and then cleared.
+  local dropped = s.dropped or 0
+  s.dropped = 0
+  local prompt = ("Post %d verified comment(s) as %s?"):format(verified, b.verdict)
+  if drafts > 0 then
+    prompt = prompt .. (" %d draft(s) will NOT post."):format(drafts)
+  end
+  if dropped > 0 then
+    prompt = prompt .. (" %d comment(s) removed from the sheet will NOT post."):format(dropped)
+  end
+  if (b.body or ""):match("^%s*$") then
+    prompt = prompt .. " Summary body is empty."
+  end
+  if b.submitted_at then
+    -- <leader>p reaches gh api without passing M.submit's already-submitted confirm, so the
+    -- re-post has to be named here too rather than landing a silent second review.
+    prompt = prompt .. (" ALREADY submitted at %s — this posts a SECOND review."):format(b.submitted_at)
+  end
+  if vim.fn.confirm(prompt, "&Yes\n&No", 2) ~= 1 then
+    vim.notify("prreview: not posted", vim.log.levels.WARN)
+    return
+  end
+  post_batch(s.pr, s.prior_submitted_at)
+end
+
+--- Wait for Claude to write the batch back, then continue the post. One-shot and bounded:
+--- silence is never consent, so the timeout notifies and posts nothing.
+---@param pr_ prreview.PR
+local function wait_for_reanchor(pr_)
+  M._stop_sheet_wait()
+  local bp = state.batch_path(pr_)
+  local dir, base = vim.fn.fnamemodify(bp, ":h"), vim.fn.fnamemodify(bp, ":t")
+  local handle = vim.uv.new_fs_event()
+  if not handle then
+    vim.notify("prreview: can't watch the batch — press <leader>p again once Claude is done", vim.log.levels.WARN)
+    return
+  end
+  local fired = false
+  -- Watch the DIRECTORY filtered to the basename, not the file: save_batch renames a tmp
+  -- file over the batch, and a file watcher holds the replaced inode (cf. start_watch).
+  -- fs_event:start returns 0 on success — 0 is truthy in Lua, so test `~= 0`.
+  local rc = handle:start(dir, {}, function(_, filename)
+    if fired or (filename and filename ~= base) then
+      return
+    end
+    -- Our own writes land on this same file — a `:w` in the sheet goes through
+    -- state.save_batch too. Waking on one would show the post confirm before Claude had
+    -- re-anchored anything, in wording indistinguishable from the real thing. Keep waiting.
+    local s, st = M._sheet, vim.uv.fs_stat(bp)
+    if s and st and s.self_write_mtime and vim.deep_equal(st.mtime, s.self_write_mtime) then
+      return
+    end
+    fired = true -- one-shot; libuv serializes these callbacks, so this can't race itself
+    vim.schedule(function()
+      M._sheet_reanchored()
+    end)
+  end)
+  if rc ~= 0 then
+    pcall(function()
+      handle:close()
+    end)
+    vim.notify("prreview: can't watch the batch — press <leader>p again once Claude is done", vim.log.levels.WARN)
+    return
+  end
+  M._sheet_wait = handle
+  vim.defer_fn(function()
+    -- Identity, not "is anything armed?": a superseded wait's timer is still pending, and
+    -- must neither cancel the wait that replaced it nor claim that one timed out.
+    if M._sheet_wait ~= handle then
+      return
+    end
+    M._stop_sheet_wait()
+    vim.notify(
+      "prreview: Claude didn't write the batch back — nothing posted. Press <leader>p to retry.",
+      vim.log.levels.WARN
+    )
+  end, 120000)
+end
+
+--- Pin the batch — and so the POST's `commit_id` — to `sha`. Only ever called when the anchors
+--- are about to be re-checked against that same sha: a re-pin without a re-anchor would ask
+--- GitHub to resolve the old line numbers against a different commit.
+---@param pr_ prreview.PR
+---@param sha string
+local function repin_head(pr_, sha)
+  local b = state.load_or_init_batch(pr_)
+  -- fresh table, not a field write: a batch that came from batch.new shares current_pr, and
+  -- re-pinning the POST must not reach through and repoint the live review's head
+  b.pr = vim.tbl_extend("force", b.pr or {}, { head_sha = sha })
+  state.save_batch(b)
+end
+
+--- Count batch comments the sheet buffer no longer shows.
+---@param b prreview.Batch
+---@param parsed table
+---@return integer
+local function count_absent_from_sheet(b, parsed)
+  local in_sheet = {}
+  for _, e in ipairs(parsed.entries or {}) do
+    if e.id then
+      in_sheet[e.id] = true
+    end
+  end
+  local absent = 0
+  for _, c in ipairs(b.comments or {}) do
+    if c.id and not in_sheet[c.id] then
+      absent = absent + 1
+    end
+  end
+  return absent
+end
+
+--- Sheet POST (`<leader>p`): fold the sheet into the batch, ask Claude to re-anchor, wait.
+--- Posts nothing itself — every route to `gh api` runs through _sheet_reanchored's confirm.
+function M._sheet_post()
+  -- A new press supersedes any earlier wait, unconditionally and before any early return can
+  -- skip it. Otherwise an abort below (stale sheet, declined drift, failed send) leaves the
+  -- previous watcher live, and Claude's answer to the SUPERSEDED request later raises a post
+  -- confirm built from stale premises — including one whose drift the human just declined.
+  M._stop_sheet_wait()
+  local s = M._sheet
+  if not (s and vim.api.nvim_buf_is_valid(s.buf)) then
+    return
+  end
+  local parsed, perr = sheet.parse(vim.api.nvim_buf_get_lines(s.buf, 0, -1, false))
+  if not parsed then
+    -- never post a batch the human didn't approve: abort before Claude is asked anything
+    vim.notify("prreview: not posted — the sheet doesn't parse: " .. perr, vim.log.levels.ERROR)
+    return
+  end
+  -- Nothing re-renders an open sheet when the batch changes on disk (start_watch only
+  -- refreshes the overlay), so a sheet goes stale the moment Claude writes a new entry — the
+  -- plugin's normal working mode. sheet.apply REPLACES b.comments with what the buffer shows,
+  -- so saving a stale sheet would permanently delete those entries. An id the batch holds and
+  -- an unedited buffer doesn't means stale, not deleted: refresh and abort instead of writing.
+  local b = state.load_or_init_batch(s.pr)
+  local modified = vim.bo[s.buf].modified
+  local absent = count_absent_from_sheet(b, parsed)
+  if absent > 0 and not modified then
+    vim.api.nvim_buf_set_lines(s.buf, 0, -1, false, sheet.render(b))
+    vim.bo[s.buf].modified = false
+    vim.notify(
+      ("prreview: not posted — the batch gained %d comment(s) while this sheet was open; "):format(absent)
+        .. "the sheet has been refreshed, re-read it and press <leader>p again",
+      vim.log.levels.WARN
+    )
+    return
+  end
+  -- An edited buffer's drops are the human's own deletions; those are legitimate, and the
+  -- POST confirm names them (save_sheet accumulates the count).
+  if modified and not save_sheet() then
+    return -- save_sheet already reported the offending line
+  end
+  local disk = state.load_or_init_batch(s.pr)
+  s.prior_submitted_at = disk.submitted_at
+
+  -- batch.serialize posts commit_id = the batch's PINNED head_sha, while the re-anchor asks
+  -- Claude to fix coordinates against the CURRENT PR head. If those disagree, GitHub resolves
+  -- the corrected line numbers against the old commit: a 422, or a comment published against
+  -- the wrong code. <leader>p never passes M.submit's drift confirm, so check here.
+  local pinned = (disk.pr and disk.pr.head_sha) or s.pr.head_sha
+  local info = gh.pr_info(s.pr.owner, s.pr.repo, s.pr.number)
+  if not info then
+    vim.notify(
+      "prreview: could not verify the PR head is unchanged (gh pr view failed) — proceeding anyway",
+      vim.log.levels.WARN
+    )
+  end
+  local new_head = (info and info.head_sha ~= pinned) and info.head_sha or nil
+
+  -- A recorded job whose channel has since died is functionally no session, and a spec-
+  -- mandated offer to post without re-anchoring beats a 120s wait that can only time out.
+  local function without_reanchor(reason)
+    local moved = new_head and " The PR head has moved since you started, so the anchors may be off." or ""
+    if vim.fn.confirm(reason .. moved .. " Post without re-anchoring?", "&Yes\n&No", 2) ~= 1 then
+      vim.notify("prreview: not posted", vim.log.levels.WARN)
+      return
+    end
+    M._sheet_reanchored()
+  end
+
+  if not (M._claude and M._claude.job) then
+    return without_reanchor("No Claude session to re-anchor.")
+  end
+  if new_head then
+    if
+      vim.fn.confirm("PR head moved since you started. Re-anchor against the new head and post?", "&Yes\n&No", 2) ~= 1
+    then
+      vim.notify("prreview: not posted (PR head moved)", vim.log.levels.WARN)
+      return
+    end
+    repin_head(s.pr, new_head) -- so commit_id matches the head Claude is about to re-anchor to
+    mark_self_write(s)
+  end
+  if not pcall(vim.api.nvim_chan_send, M._claude.job, nudge.reanchor_request_msg(state.batch_path(s.pr)) .. "\r") then
+    if new_head then
+      repin_head(s.pr, pinned) -- nothing will re-anchor now, so the anchors still describe `pinned`
+      mark_self_write(s)
+    end
+    return without_reanchor("Couldn't send to the Claude session.")
+  end
+  vim.notify("prreview: asked Claude to re-anchor — waiting, nothing posted yet")
+  wait_for_reanchor(s.pr)
+end
+
+--- Open the review sheet in its own tab: worktree branch file left, sheet right. Moving in
+--- the sheet scrolls the code pane to that comment's anchor. A sheet already open for THIS
+--- review is focused rather than duplicated — a second `nvim_create_buf` under the same name
+--- would collide with the first. A sheet left over from a different (or since-closed) review
+--- is torn down and rebuilt fresh, the same "restart heals a stale prior instance" convention
+--- open_claude uses — otherwise saving here would silently write into the wrong PR's batch.
+function M.sheet()
+  if not current_pr then
+    vim.notify("prreview: no active review (:PrReviewStart)", vim.log.levels.ERROR)
+    return
+  end
+  if M._sheet and M._sheet.pr == current_pr and vim.api.nvim_tabpage_is_valid(M._sheet.tab) then
+    vim.api.nvim_set_current_tabpage(M._sheet.tab)
+    return
+  end
+  local pr_ = current_pr
+  local b = state.load_or_init_batch(pr_)
+  if #b.comments == 0 and (b.body or ""):match("^%s*$") then
+    -- checked BEFORE tearing down any stale sheet below: a no-op call (nothing to
+    -- review for pr_) must never destroy a live, unsaved sheet for a different PR
+    vim.notify("prreview: nothing to review yet", vim.log.levels.WARN)
+    return
+  end
+  M._close_sheet()
+  vim.cmd("tabnew")
+  local tab = vim.api.nvim_get_current_tabpage()
+  local code_win = vim.api.nvim_get_current_win()
+  vim.cmd("vsplit")
+  local sheet_win = vim.api.nvim_get_current_win()
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_win_set_buf(sheet_win, buf)
+  vim.api.nvim_buf_set_name(buf, ("prreview://sheet/%s__%s__pr%d"):format(pr_.owner, pr_.repo, pr_.number))
+  vim.bo[buf].buftype = "acwrite"
+  vim.bo[buf].filetype = "markdown"
+  -- wipe (not the scratch default "hide") so closing the tab frees the name too — otherwise
+  -- a hidden-but-alive buffer blocks the NEXT :PrReviewSheet's nvim_buf_set_name with E95
+  vim.bo[buf].bufhidden = "wipe"
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, sheet.render(b))
+  vim.bo[buf].modified = false
+  M._sheet = { buf = buf, tab = tab, code_win = code_win, sheet_win = sheet_win, pr = pr_ }
+  vim.api.nvim_create_autocmd("BufWriteCmd", { buffer = buf, callback = save_sheet })
+  vim.api.nvim_create_autocmd("CursorMoved", { buffer = buf, callback = sync_code_pane })
+  vim.api.nvim_create_autocmd("BufWipeout", {
+    buffer = buf,
+    callback = function()
+      M._stop_sheet_wait() -- a wiped sheet can't be waiting on a re-anchor
+      M._sheet = nil
+    end,
+  })
+  vim.keymap.set("n", "<leader>p", M._sheet_post, { buffer = buf, desc = "prreview: post this review" })
+  sync_code_pane()
+end
+
 function M.submit()
   if not current_pr then
     vim.notify("prreview: no active review (:PrReviewStart)", vim.log.levels.ERROR)
@@ -814,7 +1330,6 @@ function M.submit()
   local b = state.load_or_init_batch(current_pr)
   -- re-running :PrReviewSubmit (or restarting the PR, which reloads this same batch)
   -- would otherwise re-POST every verified comment as a second, duplicate review
-  local prior_submitted_at = b.submitted_at
   if b.submitted_at then
     if
       vim.fn.confirm("This review was already submitted at " .. b.submitted_at .. ". Submit again?", "&Yes\n&No", 2)
@@ -852,68 +1367,9 @@ function M.submit()
       vim.notify(("prreview: %d of %d files not marked reviewed"):format(unreviewed, total), vim.log.levels.WARN)
     end
   end
-  local function do_verdict()
-    vim.ui.select({ "COMMENT", "REQUEST_CHANGES", "APPROVE" }, { prompt = "Verdict:" }, function(verdict)
-      if not verdict then
-        return
-      end
-      -- re-read here (not the `b` captured above): a verify-flip landing while this
-      -- picker was open must be included, not silently dropped from the post
-      b = state.load_or_init_batch(current_pr)
-      -- Only bail on a submitted_at that APPEARED while the picker was open (a concurrent
-      -- submit) — not on the one the user already confirmed past at the top of M.submit.
-      if b.submitted_at and b.submitted_at ~= prior_submitted_at then
-        vim.notify("prreview: submit cancelled (already submitted at " .. b.submitted_at .. ")", vim.log.levels.WARN)
-        return
-      end
-      b.verdict = verdict
-      local serialized = batch.serialize(b)
-      if #serialized.comments == 0 and (not serialized.body or serialized.body == "") then
-        vim.notify("prreview: nothing to submit", vim.log.levels.WARN)
-        return
-      end
-      local tmp = vim.fn.tempname()
-      local fd = assert(io.open(tmp, "w"))
-      fd:write(vim.json.encode(serialized))
-      fd:close()
-      local r = gh.run(gh.post_review_cmd(current_pr.owner, current_pr.repo, current_pr.number, tmp))
-      if r.code == 0 then
-        b.submitted_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
-        b.submitted_review = parse_review_id(r.stdout)
-        state.save_batch(b)
-        vim.notify("prreview: review posted")
-      else
-        vim.notify("prreview: post failed: " .. r.stderr, vim.log.levels.ERROR)
-      end
-      vim.fn.delete(tmp) -- review JSON can carry code snippets; don't leave it in tmp
-    end)
-  end
-
-  -- Empty summary body: don't silently post one. Offer to write it, delegate it to
-  -- Claude, or knowingly proceed. Checked against the fresh `b` loaded at submit start.
-  if (b.body or ""):match("^%s*$") then
-    vim.ui.select(
-      { "Write it now", "Let Claude write it", "Submit without a body", "Cancel" },
-      { prompt = "Empty review body:" },
-      function(choice)
-        if choice == "Write it now" then
-          M.body()
-        elseif choice == "Let Claude write it" then
-          if M._claude and M._claude.job then
-            pcall(vim.api.nvim_chan_send, M._claude.job, nudge.body_request_msg(state.batch_path(current_pr)) .. "\r")
-            vim.notify("prreview: asked Claude to write the body — re-run :PrReviewSubmit when it's done")
-          else
-            vim.notify("prreview: no Claude session — write the body with :PrBody", vim.log.levels.WARN)
-          end
-        elseif choice == "Submit without a body" then
-          do_verdict()
-        end
-        -- "Cancel"/nil: nothing
-      end
-    )
-  else
-    do_verdict()
-  end
+  -- Hand over: the verdict, the summary body and the final confirm are all the sheet's job
+  -- now, so :PrReviewSubmit runs its own guards and then gets out of the human's way.
+  M.sheet()
 end
 
 ---@param opts? table
@@ -934,6 +1390,7 @@ function M.setup(opts)
   vim.api.nvim_create_user_command("PrBody", M.body, {})
   vim.api.nvim_create_user_command("PrComments", M.comments, {})
   vim.api.nvim_create_user_command("PrClaude", M.claude, {})
+  vim.api.nvim_create_user_command("PrReviewSheet", M.sheet, {})
   vim.api.nvim_create_user_command("PrReviewed", M.toggle_reviewed, {})
   vim.api.nvim_create_user_command("PrReviewRefresh", function()
     if current_pr then
@@ -964,6 +1421,7 @@ function M.setup(opts)
     M._stop_watch()
     M._close_review_tree()
     M._close_claude()
+    M._close_sheet()
     panel.detach()
     pcall(vim.fn.delete, state.active_path()) -- clear active.json
     overlay.clear()
@@ -1024,6 +1482,7 @@ function M.setup(opts)
       M._stop_watch()
       M._close_review_tree()
       M._close_claude()
+      M._close_sheet()
       panel.detach()
     end,
   })
