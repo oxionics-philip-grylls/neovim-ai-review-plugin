@@ -365,6 +365,29 @@ describe("ai-review.batch.validate", function()
     local v = batch.validate({ pr = pr, body = "", comments = "garbage" })
     assert.are.same({}, v.comments)
   end)
+
+  it("gives an id-less entry an id, so the sheet can render it at all", function()
+    -- sheet.render formats `#%s` with c.id, which THROWS under LuaJIT on nil — inside
+    -- M.sheet(), before M._sheet is assigned, leaving a stranded tab and no sheet state.
+    local sheet = require("ai-review.sheet")
+    local v = batch.validate({
+      pr = pr,
+      body = "",
+      next_id = 4,
+      comments = {
+        { path = "a.rs", side = "RIGHT", line = 1, kind = "comment", status = "draft", body = "no id" },
+        { id = 7, path = "b.rs", side = "RIGHT", line = 2, kind = "comment", status = "draft", body = "numeric id" },
+      },
+    })
+    assert.are.equal("c4", v.comments[1].id)
+    assert.are.equal("c5", v.comments[2].id) -- a numeric id round-trips as an unmatchable one
+    local rendered = table.concat(sheet.render(v), "\n")
+    assert.is_truthy(rendered:find("#c4 draft", 1, true))
+    -- ...and the ids survive the round-trip, so neither entry looks like a new comment
+    local parsed = sheet.parse(sheet.render(v))
+    assert.are.equal("c4", parsed.entries[1].id)
+    assert.are.equal("c5", parsed.entries[2].id)
+  end)
 end)
 
 describe("ai-review.batch.add id uniqueness", function()

@@ -29,6 +29,13 @@ end
 --- The message asking Claude to re-anchor the batch before it's posted. The contract is
 --- deliberately narrow — anchors only — because the sheet the human just edited is the
 --- source of truth for everything else.
+---
+--- The opening sentence is an INTERFACE, not prose: peer-review SKILL.md §5c quotes the
+--- literal prefix "prreview: I've finished editing the review sheet. Please re-anchor the
+--- batch at " as its trigger. Rewording it here desynchronises the skill from the plugin
+--- with a green suite, and the failure is silent — Claude never recognises the request and
+--- the human waits out the 120s timeout. nudge_spec pins the prefix for that reason; change
+--- both, or neither.
 ---@param batch_path string
 ---@return string
 function M.reanchor_request_msg(batch_path)

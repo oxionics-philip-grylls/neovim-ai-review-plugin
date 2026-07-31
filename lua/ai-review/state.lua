@@ -129,6 +129,30 @@ local function merge_batches(d, b)
   }
 end
 
+-- mtime of the last batch write THIS process made, keyed by batch path. The sheet POST's
+-- re-anchor watcher consults it to tell Claude's write from our own: the sheet's `:w`,
+-- `:PrBody`, `:PrComments`, `:PrReviewed` and the worktree draft-staging BufWritePost all
+-- land on this same file, and waking that watcher on one of them produces a post confirm
+-- byte-identical to the genuine post-re-anchor one — consent for a re-anchor that never
+-- happened. Recorded HERE, on the one function every writer goes through, rather than at
+-- each call site, so a new writer cannot forget to.
+local self_write_mtime = {}
+
+--- mtime of the last write this process made to the batch at `path`, if any.
+---@param path string
+---@return { sec: integer, nsec: integer }?
+function M.last_self_write(path)
+  return self_write_mtime[path]
+end
+
+---@param path string
+---@return { sec: integer, nsec: integer }?
+local function stamp_self_write(path)
+  local stat = vim.uv.fs_stat(path)
+  self_write_mtime[path] = stat and stat.mtime or nil
+  return self_write_mtime[path]
+end
+
 ---@param b prreview.Batch
 ---@param root? string
 function M.save_batch(b, root)
@@ -139,8 +163,7 @@ function M.save_batch(b, root)
   -- resurrect entries this session deleted). Only for the branches where disk == b.
   local function write_as_b(text)
     write_file(path, text)
-    local stat = vim.uv.fs_stat(path)
-    b._loaded_mtime = stat and stat.mtime or nil
+    b._loaded_mtime = stamp_self_write(path)
   end
   local disk_mtime = vim.uv.fs_stat(path)
   disk_mtime = disk_mtime and disk_mtime.mtime or nil
@@ -168,6 +191,7 @@ function M.save_batch(b, root)
   -- our in-memory b. Leaving _loaded_mtime stale means a subsequent save re-reads and
   -- re-merges (idempotent) instead of clobbering the other writer's entries with b-only.
   write_file(path, batch.encode(merge_batches(d, b)))
+  stamp_self_write(path) -- still OUR write, whatever it contains
 end
 
 ---@param pr prreview.PR

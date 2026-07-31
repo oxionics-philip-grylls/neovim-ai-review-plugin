@@ -243,6 +243,21 @@ describe("ai-review.sheet parse", function()
     assert.is_truthy(err2:find("header", 1, true))
   end)
 
+  it("rejects anchors GitHub would 422 on: line 0 and a backwards range", function()
+    -- a 422 arrives after the review is already half-filed, so refuse while the human can
+    -- still fix the line
+    local _, err1 = parse("# verdict: COMMENT\n\n@@@ summary\n\n@@@ a.rs:0 [comment] #c1 draft\nx")
+    assert.is_truthy(err1:find("line numbers start at 1", 1, true))
+    assert.is_truthy(err1:find("(line 5)", 1, true)) -- still names where
+    local _, err2 = parse("# verdict: COMMENT\n\n@@@ summary\n\n@@@ a.rs:14-10 [comment] #c1 draft\nx")
+    assert.is_truthy(err2:find("backwards", 1, true))
+    -- ...and an equal start/end is a legitimate one-line range, not a rejection
+    local ok = parse("# verdict: COMMENT\n\n@@@ summary\n\n@@@ a.rs:10-10 [comment] #c1 draft\nx")
+    assert.is_not_nil(ok)
+    assert.are.equal(10, ok.entries[1].start_line)
+    assert.are.equal(10, ok.entries[1].line)
+  end)
+
   it("reports the offending line number", function()
     local _, err = parse("# verdict: COMMENT\n\n@@@ summary\n\n@@@ broken\nx")
     assert.is_truthy(err:find("line 5", 1, true))
@@ -454,6 +469,88 @@ describe("ai-review.sheet apply", function()
     assert.is_nil(select(2, sheet.apply(b, parsed)))
     assert.is_nil(b.comments[1].suggestion.verified_sha)
     assert.are.same({ "let x = 2;" }, b.comments[1].suggestion.lines)
+  end)
+
+  -- `shown` = the batch the sheet buffer was rendered from. Claude writes the same file while
+  -- the human edits, so without it apply is a replace and silently destroys Claude's work.
+  local function shown_of(b)
+    local t = {}
+    for _, c in ipairs(b.comments) do
+      t[c.id] = { status = c.status }
+    end
+    return t
+  end
+
+  it("keeps a comment that appeared on disk after the sheet was rendered, counting it merged", function()
+    local b = seeded()
+    local shown = shown_of(b) -- the render saw c1 and c2 only
+    local parsed = sheet.parse(sheet.render(b))
+    -- Claude adds c3 to the batch behind the sheet; `b` is the on-disk batch apply is given
+    batch.add(b, {
+      path = "c.rs",
+      side = "RIGHT",
+      line = 7,
+      kind = "comment",
+      origin = "claude",
+      status = "verified",
+      body = "claude's",
+    })
+    local dropped, err, merged = sheet.apply(b, parsed, shown)
+    assert.is_nil(err)
+    assert.are.equal(0, dropped) -- the human deleted nothing
+    assert.are.equal(1, merged)
+    assert.are.equal(3, #b.comments)
+    assert.are.equal("c3", b.comments[3].id)
+    assert.are.equal("claude's", b.comments[3].body)
+  end)
+
+  it("still counts a section the human deleted as a drop, not a merge", function()
+    local b = seeded()
+    local shown = shown_of(b)
+    local parsed = sheet.parse(sheet.render(b))
+    table.remove(parsed.entries, 1) -- the human deleted #c1's section
+    local dropped, err, merged = sheet.apply(b, parsed, shown)
+    assert.is_nil(err)
+    assert.are.equal(1, dropped)
+    assert.are.equal(0, merged)
+    assert.are.equal(1, #b.comments)
+    assert.are.equal("c2", b.comments[1].id)
+  end)
+
+  it("lets a draft->verified flip on disk win over the sheet's stale status", function()
+    local b = seeded()
+    local shown = shown_of(b) -- c2 was rendered as draft
+    local parsed = sheet.parse(sheet.render(b))
+    assert.are.equal("draft", parsed.entries[2].status)
+    b.comments[2].status = "verified" -- Claude verified it mid-edit
+    local dropped, err, merged = sheet.apply(b, parsed, shown)
+    assert.is_nil(err)
+    assert.are.equal(0, dropped)
+    assert.are.equal(1, merged)
+    -- reverting this to draft is how a comment the human read in the sheet silently doesn't post
+    assert.are.equal("verified", b.comments[2].status)
+  end)
+
+  it("honours a status the human changed in the sheet when disk still agrees with the render", function()
+    local b = seeded()
+    local shown = shown_of(b)
+    local parsed = sheet.parse(sheet.render(b))
+    parsed.entries[1].status = "draft" -- the human demotes #c1 so it won't post
+    local dropped, err, merged = sheet.apply(b, parsed, shown)
+    assert.is_nil(err)
+    assert.are.equal(0, merged) -- nothing landed behind them, so nothing to merge
+    assert.are.equal(0, dropped)
+    assert.are.equal("draft", b.comments[1].status)
+  end)
+
+  it("without a `shown` snapshot behaves as a plain replace (no merge, all absences drop)", function()
+    local b = seeded()
+    local parsed = sheet.parse(sheet.render(b))
+    table.remove(parsed.entries, 2)
+    local dropped, err, merged = sheet.apply(b, parsed)
+    assert.is_nil(err)
+    assert.are.equal(1, dropped)
+    assert.are.equal(0, merged)
   end)
 
   it("gives a new id-less suggestion entry no verified_sha", function()

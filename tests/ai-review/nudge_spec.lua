@@ -64,10 +64,16 @@ describe("ai-review.nudge.make", function()
 
   it("builds a re-anchor request naming the batch and the narrow contract", function()
     local msg = nudge.reanchor_request_msg("/tmp/b.json")
-    assert.is_truthy(msg:find("/tmp/b.json", 1, true))
-    assert.is_truthy(msg:lower():find("re%-anchor"))
-    -- the contract must be explicit in the message: anchors only
-    assert.is_truthy(msg:find("body", 1, true))
-    assert.is_truthy(msg:find("verdict", 1, true))
+    -- The LITERAL prefix, not a loose match: peer-review SKILL.md §5c triggers on exactly
+    -- this string. A reword desynchronises the skill from the plugin with a green suite, and
+    -- the failure is silent — Claude never recognises the request and the human waits out the
+    -- 120s timeout. (The old assertions here would have passed a message saying "rewrite every
+    -- body and set the verdict".)
+    assert.are.equal(
+      "prreview: I've finished editing the review sheet. Please re-anchor the batch at /tmp/b.json: ",
+      msg:sub(1, #"prreview: I've finished editing the review sheet. Please re-anchor the batch at /tmp/b.json: ")
+    )
+    -- and the contract stays explicit in the body of the message: anchors only
+    assert.is_truthy(msg:find("Do NOT change any `body`, the `verdict`, or the set of ids.", 1, true))
   end)
 end)

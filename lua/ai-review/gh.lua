@@ -45,6 +45,21 @@ function M.worktree_head_cmd(wt)
   return { "git", "-C", wt, "rev-parse", "HEAD" }
 end
 
+--- Move the review worktree's branch onto `onto`. REBASE, never `reset --hard`: the branch
+--- carries the verification commits `suggestion.verified_sha` points at (peer-review SKILL.md
+--- §5), and a reset would destroy them along with the proof those entries were ever tested.
+---@return string[]
+function M.worktree_rebase_cmd(wt, onto)
+  return { "git", "-C", wt, "rebase", onto }
+end
+
+--- Undo a conflicted rebase. Also the recovery for one that never started (git then exits
+--- non-zero and changes nothing), so callers can run it unconditionally after a failure.
+---@return string[]
+function M.worktree_rebase_abort_cmd(wt)
+  return { "git", "-C", wt, "rebase", "--abort" }
+end
+
 --- Run a command, never throwing and never hanging. Missing binary (vim.system throws
 --- ENOENT) or timeout both map to code=-1 with a descriptive stderr, so callers'
 --- existing `code ~= 0` handling produces the right notify everywhere.

@@ -62,7 +62,15 @@ function M.render(b)
   return out
 end
 
-local VALID_VERDICTS = { APPROVE = true, COMMENT = true, REQUEST_CHANGES = true }
+--- The three GitHub review events. Public because init.lua guards the POST with the same set
+--- (a batch written by another tool can reach it without passing through parse), and two
+--- copies of it is one copy too many for the field that decides what a review MEANS.
+M.VALID_VERDICTS = { APPROVE = true, COMMENT = true, REQUEST_CHANGES = true }
+
+--- The one header grammar, shared by `parse` and `anchor_at` so a change to it can't be made
+--- in one place only: `@@@ path:line[-line] [kind] #id status`.
+local HEADER_PAT = "^@@@ (.+):(%d+)%-?(%d*) %[(%a+)%]%s*(.*)$"
+
 local VALID_KINDS = { comment = true, suggestion = true, question = true, nit = true }
 local VALID_STATUSES = { draft = true, verified = true }
 
@@ -133,7 +141,7 @@ function M.parse(lines)
   for lnum, raw in ipairs(lines) do
     local v = raw:match("^#%s*verdict:%s*(%S+)%s*$")
     if v and not verdict and not cur and not summary_lines then
-      if not VALID_VERDICTS[v] then
+      if not M.VALID_VERDICTS[v] then
         return nil, ("invalid verdict %q — use APPROVE, COMMENT or REQUEST_CHANGES (line %d)"):format(v, lnum)
       end
       verdict = v
@@ -147,7 +155,7 @@ function M.parse(lines)
         summary_lines = {}
         cur_lines = summary_lines
       else
-        local path, l1, l2, kind, rest = raw:match("^@@@ (.+):(%d+)%-?(%d*) %[(%a+)%]%s*(.*)$")
+        local path, l1, l2, kind, rest = raw:match(HEADER_PAT)
         if not path then
           return nil, ("malformed header — expected `@@@ path:line [kind] #id status` (line %d)"):format(lnum)
         end
@@ -178,6 +186,14 @@ function M.parse(lines)
           -- rendered as start-end; the end is the anchor line
           cur.start_line, cur.line = tonumber(l1), tonumber(l2)
         end
+        -- GitHub 422s on both of these, and a 422 arrives after the review is already
+        -- half-filed; refuse here, where the human can still fix the line
+        if cur.line < 1 then
+          return nil, ("line numbers start at 1, got %d (line %d)"):format(cur.line, lnum)
+        end
+        if cur.start_line and cur.start_line > cur.line then
+          return nil, ("range runs backwards: %d-%d (line %d)"):format(cur.start_line, cur.line, lnum)
+        end
         cur_lines = {}
       end
     elseif cur_lines then
@@ -195,25 +211,50 @@ end
 --- Fold a parsed sheet back into the batch. Entries are matched by id; an id-less entry
 --- becomes a new human draft; an id that vanished from the sheet is a drop. Builds the
 --- whole comment list before assigning, so a rejected apply leaves the batch untouched.
----@param b prreview.Batch
+---
+--- `shown` turns the replace into a three-way merge, and without it this function loses
+--- work: `b` is the batch as it is on disk NOW, and Claude writes that same file while the
+--- human edits the sheet, so a straight replace deletes any comment Claude added behind the
+--- sheet and reverts a `draft -> verified` flip it landed (the comment then silently does
+--- not post). `shown` is the batch the buffer was rendered from — the discriminator for
+--- "absent because the human deleted it" vs "absent because it appeared after the render":
+---
+---   sheet wins  `body`, `path`, `line`, `start_line`, `kind`, `verdict`, summary `body`
+---   disk wins   a `status` that changed since the render, `verified_sha` on an untouched
+---               suggestion, and any id the render never showed (Claude's addition: KEPT)
+---   dropped     an id the render DID show that the buffer no longer has
+---
+--- `merged` counts what came in from disk. Report it separately from `dropped`: the two have
+--- opposite authors, and folding them together blames the human for Claude's additions.
+---@param b prreview.Batch on-disk batch, freshly loaded
 ---@param parsed table
----@return integer? dropped, string? err
-function M.apply(b, parsed)
+---@param shown? table<string, { status: string }> the batch the sheet was rendered from
+---@return integer? dropped, string? err, integer merged
+function M.apply(b, parsed, shown)
   local by_id = {}
   for _, c in ipairs(b.comments) do
     by_id[c.id] = c
   end
   local kept, seen = {}, {}
+  local merged = 0
   for _, e in ipairs(parsed.entries) do
     local c
     if e.id then
       c = by_id[e.id]
       if not c then
-        return nil, ("unknown id #%s — it doesn't match any comment in the batch"):format(e.id)
+        return nil, ("unknown id #%s — it doesn't match any comment in the batch"):format(e.id), 0
       end
       seen[e.id] = true
     else
       c = { id = nil, side = "RIGHT", origin = "human" }
+    end
+    -- A status the render showed and disk has since changed is a verify-flip that landed
+    -- mid-edit: disk wins. When disk still agrees with the render, the sheet's word stands,
+    -- so a human demoting an entry in the buffer is honoured rather than silently reverted.
+    local status = e.status
+    if e.id and shown and shown[e.id] and c.status ~= shown[e.id].status then
+      status = c.status
+      merged = merged + 1
     end
     -- verified_sha attests to code actually built and tested; an untouched suggestion
     -- keeps that provenance, but an edited one no longer describes what was verified
@@ -229,15 +270,21 @@ function M.apply(b, parsed)
       side = c.side,
       kind = e.kind,
       origin = c.origin,
-      status = e.status,
+      status = status,
       body = e.body,
       suggestion = suggestion,
     }
   end
   local dropped = 0
+  local carried = {}
   for _, c in ipairs(b.comments) do
     if not seen[c.id] then
-      dropped = dropped + 1
+      if shown and c.id and shown[c.id] == nil then
+        carried[#carried + 1] = c
+        merged = merged + 1
+      else
+        dropped = dropped + 1
+      end
     end
   end
   -- every check passed: now mutate
@@ -246,10 +293,11 @@ function M.apply(b, parsed)
       c.id = batch.alloc_id(b)
     end
   end
+  vim.list_extend(kept, carried) -- appended, so the human's ordering of their own entries holds
   b.comments = kept
   b.verdict = parsed.verdict
   b.body = parsed.body
-  return dropped, nil
+  return dropped, nil, merged
 end
 
 --- The anchor of the entry containing `lnum` (1-based), by scanning upward for its header.
@@ -264,7 +312,7 @@ function M.anchor_at(lines, lnum)
       return nil
     end
     if l and l:match("^@@@ ") then
-      local path, l1, l2 = l:match("^@@@ (.+):(%d+)%-?(%d*) %[")
+      local path, l1, l2 = l:match(HEADER_PAT)
       if not path then
         return nil
       end

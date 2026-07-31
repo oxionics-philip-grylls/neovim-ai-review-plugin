@@ -28,6 +28,17 @@ describe("ai-review.gh command builders", function()
     assert.are.same({ "git", "worktree", "prune" }, gh.worktree_prune_cmd())
     assert.are.same({ "git", "-C", "/wt/x", "rev-parse", "HEAD" }, gh.worktree_head_cmd("/wt/x"))
   end)
+
+  it("moves the review worktree with rebase, never reset --hard", function()
+    -- the branch carries the verification commits suggestion.verified_sha points at
+    local cmd = gh.worktree_rebase_cmd("/wt/x", "deadbeef")
+    assert.are.same({ "git", "-C", "/wt/x", "rebase", "deadbeef" }, cmd)
+    for _, a in ipairs(cmd) do
+      assert.are_not.equal("reset", a)
+      assert.are_not.equal("--hard", a)
+    end
+    assert.are.same({ "git", "-C", "/wt/x", "rebase", "--abort" }, gh.worktree_rebase_abort_cmd("/wt/x"))
+  end)
 end)
 
 describe("ai-review.gh.run hardening", function()

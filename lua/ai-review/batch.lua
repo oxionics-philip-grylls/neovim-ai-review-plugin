@@ -182,6 +182,18 @@ function M.validate(decoded)
     end
   end
   decoded.comments = kept
+  -- Ids are load-bearing everywhere downstream and validate is the only choke point that sees
+  -- a foreign or hand-edited file: sheet.render formats `#%s` with c.id, which THROWS under
+  -- LuaJIT on a nil one — inside M.sheet(), before M._sheet is assigned, leaving a stranded tab
+  -- with an empty buffer and no sheet state. A non-string id renders as something sheet.parse
+  -- then can't match, so the entry comes back as a new comment and the original counts as a
+  -- drop. Give any such entry a real one instead. Assigned after the loop above so alloc_id's
+  -- legacy seeding never walks a malformed entry.
+  for _, c in ipairs(kept) do
+    if type(c.id) ~= "string" then
+      c.id = M.alloc_id(decoded)
+    end
+  end
   return decoded
 end
 

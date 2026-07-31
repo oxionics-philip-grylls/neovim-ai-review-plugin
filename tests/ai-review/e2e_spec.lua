@@ -76,6 +76,10 @@ describe("ai-review end-to-end", function()
     g("commit -qam prchange")
     g("push -q origin HEAD:refs/pull/1/head")
     sh("git clone -q " .. remote .. " " .. clone)
+    -- The review worktree shares this clone's config, and `git rebase` needs a committer
+    -- identity; set one locally so the specs don't depend on the machine's global gitconfig.
+    sh("git -C " .. clone .. " config user.email h@h.co")
+    sh("git -C " .. clone .. " config user.name harness")
 
     orig_cwd = vim.fn.getcwd()
     vim.cmd.cd(clone)
@@ -90,6 +94,7 @@ describe("ai-review end-to-end", function()
       gh_run = gh.run,
       default_root = state.default_root,
       chan_send = vim.api.nvim_chan_send,
+      notify = vim.notify,
     }
     troot = vim.fn.tempname()
     state.default_root = function()
@@ -120,6 +125,10 @@ describe("ai-review end-to-end", function()
       saved.confirm,
       saved.default_root,
       saved.chan_send
+    -- Both of these are stubbed inline mid-test; restore them HERE too, or a failing assert
+    -- leaks the stub into every test that follows and degrades their diagnostics.
+    vim.notify = saved.notify
+    vim.fn.getcmdtype = nil -- assigning nil restores the builtin; a no-op if none was set
     require("ai-review")._claude = nil -- clear any fake terminal a test set
     require("ai-review")._close_sheet() -- close (not just nil) — a failed assert can leave the real tab open
     package.loaded.snacks = nil -- drop any fake snacks a test injected (real snacks isn't on the test rtp)
@@ -195,8 +204,20 @@ describe("ai-review end-to-end", function()
       height = 5,
     })
     vim.wo[float].scrollbind = true -- a value the guard must NOT touch on a float
+
+    -- ...and the guard's actual JOB, in the same call: a plain split off a diff window
+    -- inherits scrollbind/cursorbind and silently joins the diff panes' scroll group. Without
+    -- this, a mutant making _guard_scrollbind a no-op for every window passes the suite.
+    vim.cmd("new")
+    local split = vim.api.nvim_get_current_win()
+    vim.wo[split].scrollbind = true
+    vim.wo[split].cursorbind = true
+
     pr._guard_scrollbind()
     assert.is_true(vim.wo[float].scrollbind) -- float left alone
+    assert.is_false(vim.wo[split].scrollbind) -- non-diff split cleared
+    assert.is_false(vim.wo[split].cursorbind)
+    pcall(vim.api.nvim_win_close, split, true)
 
     -- and it must not run at all while a cmdline is open, whatever windows exist
     local ran = false
@@ -724,6 +745,7 @@ describe("ai-review end-to-end", function()
     end
     pr.submit() -- opens the sheet; no Claude session, so the post takes two confirms
     pr._sheet_post()
+    pr._sheet_post() -- second press: the two-phase gate's post
     assert.are.equal(1, posts)
     assert.is_not_nil(state.load_or_init_batch(prkey).submitted_at)
     say_yes = false
@@ -761,8 +783,10 @@ describe("ai-review end-to-end", function()
     end -- "yes" — allow the re-submit, and each post's own confirm, through
     pr.submit()
     pr._sheet_post()
+    pr._sheet_post() -- second press: the two-phase gate's post
     assert.are.equal(1, posts)
     pr.submit() -- confirmed re-submit: the already-confirmed submitted_at must NOT block it
+    pr._sheet_post()
     pr._sheet_post()
     assert.are.equal(2, posts)
     vim.cmd("tabclose")
@@ -1066,6 +1090,7 @@ describe("ai-review end-to-end", function()
     end
     pr.submit()
     pr._sheet_post()
+    pr._sheet_post() -- second press: the two-phase gate's post
     vim.notify = orig_notify
     assert.is_true(warned) -- warned...
     assert.are.equal(1, posts) -- ...but did NOT block the post
@@ -1341,7 +1366,7 @@ describe("ai-review end-to-end", function()
     assert.are.equal(0, posts.n)
     assert.is_not_nil(pr._sheet_wait) -- armed, waiting on the batch
 
-    -- Claude writes the batch back; the plugin re-renders and asks to confirm
+    -- Claude writes the batch back; the plugin re-renders and hands control back
     local reanchored = state.load_or_init_batch(prkey)
     reanchored.comments[1].line = 3
     state.save_batch(reanchored)
@@ -1349,6 +1374,8 @@ describe("ai-review end-to-end", function()
       return 1 -- yes
     end
     pr._sheet_reanchored()
+    assert.are.equal(0, posts.n) -- the re-anchor alone must not post; the human hasn't read it
+    pr._sheet_post() -- second press: post what is now on screen
     assert.are.equal(1, posts.n)
     local after = state.load_or_init_batch(prkey)
     assert.is_not_nil(after.submitted_at)
@@ -1367,6 +1394,94 @@ describe("ai-review end-to-end", function()
       return 2 -- no
     end
     pr._sheet_reanchored()
+    pr._sheet_post() -- second press: reaches the confirm, which is declined
+    assert.are.equal(0, posts.n)
+    assert.is_nil(state.load_or_init_batch(prkey).submitted_at)
+    vim.cmd("tabclose")
+    close_diffview_and_wait()
+  end)
+
+  it("the first <leader>p after a re-anchor does not post; the second does", function()
+    local prkey = open_sheet_with_one_comment()
+    pr._claude = { win = nil, buf = 1, job = 99 }
+    local posts = count_posts('{"id":3}')
+    local sent = 0
+    vim.api.nvim_chan_send = function()
+      sent = sent + 1
+    end
+    local confirms = 0
+    vim.fn.confirm = function()
+      confirms = confirms + 1
+      return 1 -- say yes to everything: the GATE, not the human, has to hold the first press
+    end
+
+    pr._sheet_post() -- press 1: asks Claude, waits
+    local d = state.load_or_init_batch(prkey)
+    d.comments[1].line = 3
+    state.save_batch(d)
+
+    local msg
+    local real_notify = vim.notify
+    vim.notify = function(m)
+      if type(m) == "string" and m:find("anchor(s) changed", 1, true) then
+        msg = m
+      end
+    end
+    pr._sheet_reanchored()
+    vim.notify = real_notify
+
+    -- the re-render alone posts nothing, and says how much moved and what to do next
+    assert.are.equal(0, posts.n)
+    assert.are.equal(0, confirms) -- no modal took over the screen the human must read
+    assert.is_truthy(msg and msg:find("1 anchor(s) changed", 1, true))
+    assert.is_truthy(msg:find("<leader>p to post", 1, true))
+
+    pr._sheet_post() -- press 2
+    assert.are.equal(1, confirms) -- now the post confirm, once
+    assert.are.equal(1, posts.n)
+    assert.are.equal(1, sent) -- and the re-anchor was NOT re-run on the second press
+    assert.is_not_nil(state.load_or_init_batch(prkey).submitted_at)
+    vim.cmd("tabclose")
+    close_diffview_and_wait()
+  end)
+
+  it("refuses to post when the re-anchor changed anything but the anchors", function()
+    local prkey = open_sheet_with_one_comment()
+    pr._claude = { win = nil, buf = 1, job = 99 }
+    local posts = count_posts()
+    vim.api.nvim_chan_send = function() end
+    vim.fn.confirm = function()
+      return 1 -- yes to anything; the contract check has to get there first
+    end
+    pr._sheet_post()
+
+    -- a Claude that quietly rewords a body and flips the verdict, then says it's ready
+    local d = state.load_or_init_batch(prkey)
+    d.comments[1].line = 3 -- a legitimate anchor fix...
+    d.comments[1].body = "words the human never approved" -- ...and one that isn't
+    d.verdict = "APPROVE"
+    state.save_batch(d)
+
+    local errored
+    local real_notify = vim.notify
+    vim.notify = function(msg, lvl)
+      if lvl == vim.log.levels.ERROR then
+        errored = msg
+      end
+    end
+    pr._sheet_reanchored()
+    vim.notify = real_notify
+
+    assert.is_truthy(errored and errored:find("more than the anchors", 1, true))
+    assert.is_truthy(errored:find("#c1 body", 1, true)) -- itemised: which id, which field
+    assert.is_truthy(errored:find("verdict COMMENT->APPROVE", 1, true))
+    assert.are.equal(0, posts.n)
+    -- the sheet still shows what the human approved, not Claude's rewrite
+    local rendered = table.concat(vim.api.nvim_buf_get_lines(pr._sheet.buf, 0, -1, false), "\n")
+    assert.is_truthy(rendered:find("original", 1, true))
+    assert.is_nil(rendered:find("words the human never approved", 1, true))
+    -- ...and the refusal is sticky: pressing again must not post it either
+    pr._sheet_post()
     assert.are.equal(0, posts.n)
     assert.is_nil(state.load_or_init_batch(prkey).submitted_at)
     vim.cmd("tabclose")
@@ -1481,6 +1596,7 @@ describe("ai-review end-to-end", function()
       return 2
     end
     pr._sheet_reanchored()
+    pr._sheet_post() -- second press: the confirm the human reads before publishing
     assert.is_not_nil(prompt)
     assert.is_truthy(prompt:find("1 verified", 1, true))
     assert.is_truthy(prompt:find("1 draft", 1, true)) -- a silently-unverified comment can't vanish
@@ -1505,6 +1621,7 @@ describe("ai-review end-to-end", function()
       return 1 -- the human says yes; the guard, not the confirm, has to stop this
     end
     pr._sheet_reanchored()
+    pr._sheet_post() -- second press: the concurrent-submit guard, not the confirm, must stop this
     assert.are.equal(0, posts.n)
     assert.are.equal("2026-01-01T00:00:00Z", state.load_or_init_batch(prkey).submitted_at)
     vim.cmd("tabclose")
@@ -1641,6 +1758,146 @@ describe("ai-review end-to-end", function()
     close_diffview_and_wait()
   end)
 
+  -- Open the sheet on a single DRAFT comment, so a test can flip it to verified behind the
+  -- sheet the way Claude's §5b verification pass does.
+  local function open_sheet_with_one_draft()
+    pr.start("https://github.com/test/repo/pull/1")
+    local prkey = { owner = "test", repo = "repo", number = 1 }
+    local b = state.load_or_init_batch(prkey)
+    batch.add(b, {
+      path = "file.txt",
+      side = "RIGHT",
+      line = 2,
+      kind = "comment",
+      origin = "human",
+      status = "draft",
+      body = "needs verifying",
+    })
+    b.verdict = "COMMENT"
+    state.save_batch(b)
+    vim.cmd("PrReviewSheet")
+    return prkey
+  end
+
+  -- Replace the first buffer line equal to `from` with `to`, leaving the buffer `modified`.
+  local function edit_sheet_line(from, to)
+    local lines = vim.api.nvim_buf_get_lines(pr._sheet.buf, 0, -1, false)
+    for i, l in ipairs(lines) do
+      if l == from then
+        lines[i] = to
+        break
+      end
+    end
+    vim.api.nvim_buf_set_lines(pr._sheet.buf, 0, -1, false, lines)
+    assert.is_true(vim.bo[pr._sheet.buf].modified)
+  end
+
+  -- Capture the "sheet saved (...)" notify around a `:w` of the sheet.
+  local function write_sheet()
+    local saved_msg
+    local real_notify = vim.notify
+    vim.notify = function(msg)
+      if type(msg) == "string" and msg:find("sheet saved", 1, true) then
+        saved_msg = msg
+      end
+    end
+    vim.api.nvim_buf_call(pr._sheet.buf, function()
+      vim.cmd("write")
+    end)
+    vim.notify = real_notify
+    return saved_msg
+  end
+
+  it("a comment Claude added behind a modified sheet survives the save instead of being deleted", function()
+    local prkey = open_sheet_with_one_comment()
+    -- The human edits a body, so the buffer is `modified` and the stale-sheet guard steps
+    -- aside — which is exactly the path on which sheet.apply used to be a straight replace.
+    edit_sheet_line("original", "the human's edit")
+
+    local b = state.load_or_init_batch(prkey)
+    batch.add(b, {
+      path = "file.txt",
+      side = "RIGHT",
+      line = 3,
+      kind = "comment",
+      origin = "claude",
+      status = "verified",
+      body = "claude added this",
+    })
+    state.save_batch(b)
+
+    local saved_msg = write_sheet()
+
+    local after = state.load_or_init_batch(prkey)
+    assert.are.equal(2, #after.comments) -- Claude's comment was NOT deleted from disk
+    assert.are.equal("the human's edit", after.comments[1].body) -- the sheet still wins for body
+    assert.are.equal("claude added this", after.comments[2].body)
+    -- reported separately: the human dropped nothing, one change came in from the batch
+    assert.is_truthy(saved_msg and saved_msg:find("0 dropped", 1, true))
+    assert.is_truthy(saved_msg:find("1 merged from the batch", 1, true))
+    -- ...and the buffer now shows it, so the POST confirm's counts aren't built on a fiction
+    local rendered = table.concat(vim.api.nvim_buf_get_lines(pr._sheet.buf, 0, -1, false), "\n")
+    assert.is_truthy(rendered:find("claude added this", 1, true))
+    vim.cmd("tabclose")
+    close_diffview_and_wait()
+  end)
+
+  it("a draft->verified flip landing behind a modified sheet is not reverted by the save", function()
+    local prkey = open_sheet_with_one_draft()
+    edit_sheet_line("needs verifying", "reworded by the human")
+
+    local d = state.load_or_init_batch(prkey) -- Claude verifies it while the human types
+    d.comments[1].status = "verified"
+    state.save_batch(d)
+
+    local saved_msg = write_sheet()
+
+    local after = state.load_or_init_batch(prkey)
+    -- reverting this to `draft` is how a comment the human read in the sheet silently doesn't post
+    assert.are.equal("verified", after.comments[1].status)
+    assert.are.equal("reworded by the human", after.comments[1].body) -- sheet still wins for body
+    assert.is_truthy(saved_msg and saved_msg:find("1 merged from the batch", 1, true))
+    vim.cmd("tabclose")
+    close_diffview_and_wait()
+  end)
+
+  it("refuses to post an unmodified sheet whose statuses the batch has moved on from", function()
+    local prkey = open_sheet_with_one_draft()
+    local posts = count_posts()
+    pr._claude = { win = nil, buf = 1, job = 99 }
+    local sent
+    vim.api.nvim_chan_send = function(_, data)
+      sent = data
+    end
+    vim.fn.confirm = function()
+      return 1 -- yes to anything; the staleness check has to get there first
+    end
+
+    local d = state.load_or_init_batch(prkey)
+    d.comments[1].status = "verified" -- a flip, no new comment: id presence alone can't see this
+    state.save_batch(d)
+
+    local warned
+    local real_notify = vim.notify
+    vim.notify = function(msg, lvl)
+      if lvl == vim.log.levels.WARN then
+        warned = msg
+      end
+    end
+    pr._sheet_post() -- the human typed nothing
+    vim.notify = real_notify
+
+    assert.is_truthy(warned and warned:find("status change", 1, true))
+    assert.are.equal(0, posts.n)
+    assert.is_nil(sent) -- Claude was never asked
+    assert.is_nil(pr._sheet_wait)
+    -- the sheet now shows the flip, so the next press posts what the human has actually read
+    local rendered = table.concat(vim.api.nvim_buf_get_lines(pr._sheet.buf, 0, -1, false), "\n")
+    assert.is_truthy(rendered:find("#c1 verified", 1, true))
+    vim.cmd("tabclose")
+    close_diffview_and_wait()
+  end)
+
   it("the post confirm names comments the human deleted from the sheet", function()
     local prkey = open_sheet_with_two_comments("COMMENT", "overall")
     local posts = count_posts()
@@ -1664,6 +1921,7 @@ describe("ai-review end-to-end", function()
       return 2 -- ...and decline that, so nothing posts
     end
     pr._sheet_post()
+    pr._sheet_post() -- second press: the two-phase gate's post confirm
 
     local post_prompt = prompts[#prompts]
     assert.are.equal(2, #prompts)
@@ -1728,10 +1986,16 @@ describe("ai-review end-to-end", function()
     vim.fn.confirm = function()
       return 1
     end
+    local wt = state.worktree_path(prkey)
     pr._sheet_post()
     -- re-pinned before Claude was asked, so the corrected anchors and commit_id agree
     assert.are.equal(moved_sha, state.load_or_init_batch(prkey).pr.head_sha)
+    -- ...and the rest of the state Claude is told to read moved with it, or it would be
+    -- re-anchoring "on the PR head" against a stale sha and a stale checkout
+    assert.are.equal(moved_sha, sh("git -C " .. wt .. " rev-parse HEAD"))
+    assert.are.equal(moved_sha, state.read_active().head_sha)
     pr._sheet_reanchored()
+    pr._sheet_post() -- second press: the two-phase gate's post
 
     assert.is_not_nil(payload)
     assert.are.equal("REQUEST_CHANGES", payload.event)
@@ -1772,6 +2036,70 @@ describe("ai-review end-to-end", function()
     close_diffview_and_wait()
   end)
 
+  it("a head move that conflicts with the review branch moves nothing and posts nothing", function()
+    local prkey = open_sheet_with_one_comment()
+    local pinned = state.load_or_init_batch(prkey).pr.head_sha
+    local wt = state.worktree_path(prkey)
+    local posts = count_posts()
+    pr._claude = { win = nil, buf = 1, job = 99 }
+    local sent
+    vim.api.nvim_chan_send = function(_, data)
+      sent = data
+    end
+    vim.fn.confirm = function()
+      return 1 -- yes to the drift confirm; the conflicting rebase has to stop this
+    end
+
+    -- A verification commit on review/pr-1-suggestions, on the same line the new PR head
+    -- rewrites. `suggestion.verified_sha` names commits like this one, which is why the
+    -- worktree is moved by rebase: `reset --hard` would silently destroy them.
+    vim.fn.writefile({ "line1", "VERIFIED-FIX", "line3" }, wt .. "/file.txt")
+    sh("git -C " .. wt .. " commit -qam claude-verified-fix")
+    local verification_sha = sh("git -C " .. wt .. " rev-parse HEAD")
+    local active_before = state.read_active().head_sha
+
+    local moved_sha = sh("git -C " .. root .. "/seed rev-parse HEAD")
+    gh.pr_info = function()
+      return { base = "master", head_sha = moved_sha }
+    end
+
+    local errored
+    local real_notify = vim.notify
+    vim.notify = function(msg, lvl)
+      if lvl == vim.log.levels.ERROR then
+        errored = msg
+      end
+    end
+    pr._sheet_post()
+    vim.notify = real_notify
+
+    assert.is_truthy(errored and errored:find("conflicts with review/pr-1-suggestions", 1, true))
+    assert.are.equal(0, posts.n)
+    assert.is_nil(sent) -- Claude was never asked to re-anchor against a head we couldn't reach
+    assert.is_nil(pr._sheet_wait)
+    -- nothing moved: batch pin, active.json and the worktree are all where they were...
+    assert.are.equal(pinned, state.load_or_init_batch(prkey).pr.head_sha)
+    assert.are.equal(active_before, state.read_active().head_sha)
+    assert.are.equal(verification_sha, sh("git -C " .. wt .. " rev-parse HEAD")) -- commit intact
+    -- ...and the rebase was aborted, not left half-applied (mid-rebase HEAD is detached)
+    assert.are.equal("review/pr-1-suggestions", sh("git -C " .. wt .. " rev-parse --abbrev-ref HEAD"))
+    assert.are.equal("", sh("git -C " .. wt .. " status --porcelain"))
+    vim.cmd("tabclose")
+    close_diffview_and_wait()
+  end)
+
+  -- Write the batch the way ANOTHER process (Claude) does. state.save_batch records the mtime
+  -- of every write THIS process makes and the re-anchor watcher ignores those, so an in-process
+  -- save_batch can no longer stand in for Claude — that is the point of the suppression.
+  local function foreign_save(prkey, b)
+    local path = state.batch_path(prkey)
+    local tmp = path .. ".foreign"
+    local fd = assert(io.open(tmp, "w"))
+    fd:write(batch.encode(b))
+    fd:close()
+    assert(os.rename(tmp, path)) -- atomic, like state.save_batch's own write
+  end
+
   it("a :w in the sheet during the wait does not wake the re-anchor confirm; a foreign write does", function()
     local prkey = open_sheet_with_one_comment()
     local posts = count_posts()
@@ -1799,12 +2127,49 @@ describe("ai-review end-to-end", function()
     -- ...but a write we did NOT make still wakes it, so the suppression didn't break the wait
     local d = state.load_or_init_batch(prkey)
     d.comments[1].line = 3
-    state.save_batch(d)
+    foreign_save(prkey, d)
     vim.wait(3000, function()
-      return confirms > 0
+      return pr._sheet_wait == nil
     end, 20)
-    assert.are.equal(1, confirms)
-    assert.are.equal(0, posts.n) -- declined
+    assert.is_nil(pr._sheet_wait) -- woken and disarmed by the write that wasn't ours
+    -- the wake re-renders and hands back (the two-phase gate); it must not confirm or post
+    local rendered = table.concat(vim.api.nvim_buf_get_lines(pr._sheet.buf, 0, -1, false), "\n")
+    assert.is_truthy(rendered:find("@@@ file.txt:3 ", 1, true)) -- Claude's corrected anchor
+    assert.are.equal(0, confirms)
+    assert.are.equal(0, posts.n)
+    vim.cmd("tabclose")
+    close_diffview_and_wait()
+  end)
+
+  it("a batch write from somewhere other than the sheet does not raise a post confirm", function()
+    -- mark_self_write used to be called from save_sheet and the re-pin only, so :PrReviewed,
+    -- :PrBody, :PrComments and the worktree draft-staging handler each woke the watcher and
+    -- produced a confirm byte-identical to the genuine post-re-anchor one.
+    local prkey = open_sheet_with_one_comment()
+    local posts = count_posts()
+    pr._claude = { win = nil, buf = 1, job = 99 }
+    vim.api.nvim_chan_send = function() end
+    local confirms = 0
+    vim.fn.confirm = function()
+      confirms = confirms + 1
+      return 2 -- decline, so even a spurious wake can't post
+    end
+    pr._sheet_post()
+    assert.is_not_nil(pr._sheet_wait)
+
+    local diffview = require("diffview.lib")
+    local orig = diffview.get_current_view
+    diffview.get_current_view = function()
+      return { cur_entry = { path = "file.txt" } }
+    end
+    vim.cmd("PrReviewed") -- a real batch write, from a command that isn't the sheet
+    diffview.get_current_view = orig
+    vim.wait(500)
+
+    assert.is_true(batch.is_reviewed(state.load_or_init_batch(prkey), "file.txt")) -- it did write
+    assert.are.equal(0, confirms) -- ...and it did not ask to publish anything
+    assert.are.equal(0, posts.n)
+    assert.is_not_nil(pr._sheet_wait) -- still waiting on the real answer
     vim.cmd("tabclose")
     close_diffview_and_wait()
   end)
