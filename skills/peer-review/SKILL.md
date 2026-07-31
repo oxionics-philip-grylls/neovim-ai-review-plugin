@@ -105,6 +105,31 @@ process the batch at `active.json.batch_path`:
   complete file and re-renders (draft badges flip to ✓).
 - You never set `verdict` — the human owns it and submits via `:PrReviewSubmit`.
 
+### 5c. Re-anchor before the human posts (Neovim-driven)
+
+When the plugin sends "prreview: I've finished editing the review sheet. Please re-anchor
+the batch at `<path>`", the human has just finished their final pass in the review sheet and
+is **waiting to post**. Do exactly this and nothing more:
+
+1. Read the batch at that path.
+2. For every entry, read the target line(s) on the PR head and confirm
+   `path`/`line`/`start_line`/`side` still identify the code the `body` is talking about.
+   Where an anchor drifted, correct it. Anchors always exist — the sheet refuses to save an
+   entry without one — so this is **correction, never invention**.
+3. Write the batch back (atomically, as in §5b) and say it's ready.
+
+**Do not change any `body`, the top-level `verdict`, or the set of ids.** The sheet the human
+just edited is the source of truth for all of those: the plugin re-renders from the file you
+write and posts what the human then confirms, so silently rewording a comment publishes words
+they never approved. Dropping or adding an entry here does the same.
+
+The plugin is watching the file and continues the moment you write it, so **write once, when
+you're done** — not incrementally.
+
+If the human's `:PrReviewSubmit` reported that the PR head had moved, the plugin re-pins the
+batch to the new head *before* sending this request, so "the PR head" means the new head and
+the posted `commit_id` will match the anchors you set.
+
 ## 6. Capture cross-cutting issues as handoffs
 
 When the review surfaces something that doesn't belong in a fix — a design decision the author must make, a refactor out of scope, a problem owned by another component — make it a **plain review comment** (and, if it needs tracking, a note under `.claude/notes/`). Don't force out-of-scope work into a suggestion; "here's the concern, here's why, your call" is the right output.
