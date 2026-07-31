@@ -128,7 +128,11 @@ you're done** — not incrementally.
 
 If the human's `:PrReviewSubmit` reported that the PR head had moved, the plugin re-pins the
 batch to the new head *before* sending this request, so "the PR head" means the new head and
-the posted `commit_id` will match the anchors you set.
+the posted `commit_id` will match the anchors you set. It also **rebases the shared worktree
+(`active.json.worktree`) onto that head** and rewrites `active.json` first, so the checkout
+you read and the `head_sha` you read are already the new head — don't re-fetch or move the
+worktree yourself. (Had the rebase conflicted, the plugin would have aborted it, changed
+nothing and refused to post, and you would never have received this request.)
 
 ## 6. Capture cross-cutting issues as handoffs
 
