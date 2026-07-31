@@ -388,6 +388,32 @@ describe("ai-review.batch.validate", function()
     assert.are.equal("c4", parsed.entries[1].id)
     assert.are.equal("c5", parsed.entries[2].id)
   end)
+
+  it("never mints an id that collides with one already in the batch, even when next_id lags", function()
+    -- A foreign batch whose next_id lags its own ids: next_id=2 but a "c2" already exists.
+    -- alloc_id only rescans to seed next_id when next_id is nil, so a naive assignment here
+    -- hands the id-less entry "c2" too — a duplicate that sheet.parse then rejects outright.
+    local sheet = require("ai-review.sheet")
+    local v = batch.validate({
+      pr = pr,
+      body = "",
+      next_id = 2,
+      comments = {
+        { id = "c2", path = "a.rs", side = "RIGHT", line = 1, kind = "comment", status = "draft", body = "existing" },
+        { path = "b.rs", side = "RIGHT", line = 2, kind = "comment", status = "draft", body = "no id" },
+      },
+    })
+    assert.are_not.equal("c2", v.comments[2].id)
+    local seen = {}
+    for _, c in ipairs(v.comments) do
+      assert.is_nil(seen[c.id], "duplicate id: " .. tostring(c.id))
+      seen[c.id] = true
+    end
+    -- the whole point: this must round-trip through render/parse without a duplicate-id error
+    local parsed, err = sheet.parse(sheet.render(v))
+    assert.is_nil(err)
+    assert.is_not_nil(parsed)
+  end)
 end)
 
 describe("ai-review.batch.add id uniqueness", function()

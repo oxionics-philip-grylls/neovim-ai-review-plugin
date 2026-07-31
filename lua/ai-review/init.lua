@@ -1041,12 +1041,19 @@ end
 --- notify is transient, and on the path the spec worries about (a deleted section silently
 --- deleting a comment) the very next thing on screen is a modal confirm that takes over the
 --- message area. The POST confirm names both totals, and clears them once it has run.
+---
+--- Clears `s.ready_to_post`: that flag means "the human has read a re-anchored sheet, post it
+--- unchanged on the next press", and a save between the two presses is a NEW edit that was
+--- never re-anchored or drift-checked. Without this, saving there leaves the flag set and the
+--- next `<leader>p` takes the post-immediately branch — skipping the re-anchor request and the
+--- drift check the two-phase gate exists to run.
 ---@return boolean ok, integer? dropped
 local function save_sheet()
   local s = M._sheet
   if not s then
     return false
   end
+  s.ready_to_post = false
   local parsed, perr = sheet.parse(vim.api.nvim_buf_get_lines(s.buf, 0, -1, false))
   if not parsed then
     vim.notify("prreview: sheet not saved — " .. perr, vim.log.levels.ERROR)
@@ -1077,14 +1084,16 @@ local function save_sheet()
 end
 
 --- Everything the batch changed outside the re-anchor contract, itemised. The contract —
---- Claude may move `path`/`line`/`start_line`/`side` and nothing else — lived entirely in
---- SKILL.md prose, on the far side of a model, guarding the one irreversible action in the
---- system: a Claude that reworded a `body`, flipped the `verdict` or dropped an entry
---- published it under a confirm that named only counts.
+--- Claude may move `path`/`line`/`start_line`/`side`, and (see below) flip `status`, and
+--- nothing else — lived entirely in SKILL.md prose, on the far side of a model, guarding the
+--- one irreversible action in the system: a Claude that reworded a `body`, flipped the
+--- `verdict` or dropped an entry published it under a confirm that named only counts.
 ---
---- `status` is deliberately NOT part of the contract: a `draft -> verified` flip landing here
---- is legitimate §5b work, and reverting it is what C2 exists to stop. It changes what posts,
---- so the confirm's verified/draft counts are where the human sees it.
+--- `status` is the ONE ratified exception, not an oversight — do not add it back to the
+--- violation list below. A `draft -> verified` flip landing here is legitimate §5b work
+--- (Claude finishing verification mid-pass), and reverting it is what C2 exists to stop.
+--- See the design doc's "Re-anchoring" section for the reasoning. It changes what posts, so
+--- the confirm's verified/draft counts are where the human sees it.
 ---@param shown table sheet_snapshot of the batch the human read
 ---@param b prreview.Batch what is on disk now
 ---@return string[] itemised, sorted (pairs() order isn't stable and the message is asserted on)
@@ -1387,15 +1396,26 @@ local function move_to_head(s, sha)
   end
   local r = gh.run(gh.worktree_rebase_cmd(wt, sha))
   if r.code ~= 0 then
-    gh.run(gh.worktree_rebase_abort_cmd(wt)) -- exit code ignored: also fails when none started
+    -- Also "succeeds" when no rebase ever started, so it's always safe to run here — but a
+    -- REAL abort can itself fail (e.g. the worktree dir vanished mid-rebase), and the notify
+    -- below used to claim "nothing was changed" unconditionally. Check it: on failure the
+    -- worktree is left mid-rebase, and the human needs to know that, not a false all-clear.
+    local abort = gh.run(gh.worktree_rebase_abort_cmd(wt))
+    local abort_note
+    if abort.code == 0 then
+      abort_note = ("The rebase was aborted and nothing was changed — resolve it in %s, or restart the review."):format(
+        wt
+      )
+    else
+      abort_note = ("The rebase abort ALSO failed — %s is left mid-rebase and needs manual attention."):format(wt)
+    end
     vim.notify(
       ("prreview: not posted — the PR head moved in a way that conflicts with review/pr-%d-suggestions. "):format(
         pr_.number
       )
-        .. ("The rebase was aborted and nothing was changed — resolve it in %s, or restart the review. %s"):format(
-          wt,
-          vim.trim(r.stderr ~= "" and r.stderr or r.stdout)
-        ),
+        .. abort_note
+        .. " "
+        .. vim.trim(r.stderr ~= "" and r.stderr or r.stdout),
       vim.log.levels.ERROR
     )
     return false
@@ -1409,7 +1429,20 @@ local function move_to_head(s, sha)
       p.head_sha = sha
     end
   end
-  state.write_active(pr_, pr_url_of(pr_))
+  -- state.write_active errors (via write_file) rather than returning a status, and by this
+  -- point the worktree and the batch pin have ALREADY moved to `sha` — an uncaught error here
+  -- would escape with those moved and active.json stale. pcall it and refuse instead, naming
+  -- the inconsistency, so the human knows the state (not just this post) needs attention.
+  local wrote_active = pcall(state.write_active, pr_, pr_url_of(pr_))
+  if not wrote_active then
+    vim.notify(
+      ("prreview: not posted — the worktree and batch moved to the new head (%s) but active.json did not; "):format(
+        sha
+      ) .. "the review state is now inconsistent — check active.json, or restart the review",
+      vim.log.levels.ERROR
+    )
+    return false
+  end
   -- The code pane is a worktree file that just changed underneath it; clear the same-anchor
   -- cache so the re-sync actually happens and the human reads the head they're posting against.
   s.last_anchor = nil

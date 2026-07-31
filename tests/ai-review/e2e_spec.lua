@@ -1445,6 +1445,48 @@ describe("ai-review end-to-end", function()
     close_diffview_and_wait()
   end)
 
+  it("a saved edit between the two presses forces the full flow instead of posting immediately", function()
+    -- Item 1 regression: save_sheet used to leave `ready_to_post` untouched, so a human
+    -- edit saved AFTER the re-anchor (but before the confirming second press) slipped
+    -- through the "post what's on screen" branch — skipping the re-anchor request and
+    -- the drift check that branch exists to have already run.
+    local prkey = open_sheet_with_one_comment()
+    pr._claude = { win = nil, buf = 1, job = 99 }
+    local posts = count_posts('{"id":9}')
+    local sent = 0
+    vim.api.nvim_chan_send = function()
+      sent = sent + 1
+    end
+    vim.fn.confirm = function()
+      return 1 -- say yes to everything the human is asked
+    end
+
+    pr._sheet_post() -- press 1: asks Claude, waits
+    local d = state.load_or_init_batch(prkey)
+    d.comments[1].line = 3
+    state.save_batch(d)
+    pr._sheet_reanchored() -- phase 2: re-renders and arms ready_to_post
+    assert.is_true(pr._sheet.ready_to_post)
+
+    -- the human edits the now-approved sheet and saves it (an unsaved edit already
+    -- falls through correctly via the `modified` check; this exercises the saved case)
+    local lines = vim.api.nvim_buf_get_lines(pr._sheet.buf, 0, -1, false)
+    lines[#lines + 1] = "an extra thought, added after the re-anchor"
+    vim.api.nvim_buf_set_lines(pr._sheet.buf, 0, -1, false, lines)
+    vim.api.nvim_buf_call(pr._sheet.buf, function()
+      vim.cmd("write")
+    end)
+    assert.is_false(pr._sheet.ready_to_post) -- the save invalidated the pending post
+
+    pr._sheet_post() -- press 2 after the save: must run the FULL flow, not post directly
+    assert.are.equal(0, posts.n) -- nothing posted without a re-anchor and a drift check
+    assert.are.equal(2, sent) -- a fresh re-anchor request went out (not a re-use of press 1's)
+    assert.is_not_nil(pr._sheet_wait) -- waiting on Claude again, not confirmed-and-posted
+    assert.is_nil(state.load_or_init_batch(prkey).submitted_at)
+    vim.cmd("tabclose")
+    close_diffview_and_wait()
+  end)
+
   it("refuses to post when the re-anchor changed anything but the anchors", function()
     local prkey = open_sheet_with_one_comment()
     pr._claude = { win = nil, buf = 1, job = 99 }
@@ -2084,6 +2126,112 @@ describe("ai-review end-to-end", function()
     -- ...and the rebase was aborted, not left half-applied (mid-rebase HEAD is detached)
     assert.are.equal("review/pr-1-suggestions", sh("git -C " .. wt .. " rev-parse --abbrev-ref HEAD"))
     assert.are.equal("", sh("git -C " .. wt .. " status --porcelain"))
+    vim.cmd("tabclose")
+    close_diffview_and_wait()
+  end)
+
+  it("says the worktree needs manual attention when the rebase abort itself fails", function()
+    -- Item 2 regression: the abort's exit code was discarded, so a failed abort still got
+    -- the "aborted and nothing was changed" message — false, and the worktree is left
+    -- mid-rebase with nobody told.
+    local prkey = open_sheet_with_one_comment()
+    local wt = state.worktree_path(prkey)
+    local posts = count_posts()
+    pr._claude = { win = nil, buf = 1, job = 99 }
+    vim.api.nvim_chan_send = function() end
+    vim.fn.confirm = function()
+      return 1 -- yes to the drift confirm; the conflicting rebase has to stop this
+    end
+
+    -- Same conflicting-rebase setup as the test above, so the rebase itself genuinely fails
+    -- and move_to_head reaches the abort call.
+    vim.fn.writefile({ "line1", "VERIFIED-FIX", "line3" }, wt .. "/file.txt")
+    sh("git -C " .. wt .. " commit -qam claude-verified-fix")
+    local moved_sha = sh("git -C " .. root .. "/seed rev-parse HEAD")
+    gh.pr_info = function()
+      return { base = "master", head_sha = moved_sha }
+    end
+
+    -- Stub only the abort command to fail; every other gh.run call (including the real,
+    -- genuinely-conflicting rebase) passes through.
+    local real_run = gh.run
+    gh.run = function(cmd)
+      if cmd[1] == "git" and cmd[4] == "rebase" and cmd[5] == "--abort" then
+        return { code = 1, stdout = "", stderr = "fatal: no rebase in progress" }
+      end
+      return real_run(cmd)
+    end
+
+    local errored
+    local real_notify = vim.notify
+    vim.notify = function(msg, lvl)
+      if lvl == vim.log.levels.ERROR then
+        errored = msg
+      end
+    end
+    pr._sheet_post()
+    vim.notify = real_notify
+
+    assert.is_truthy(errored)
+    assert.is_truthy(errored:find("needs manual attention", 1, true))
+    assert.is_nil(errored:find("nothing was changed", 1, true)) -- the false all-clear is gone
+    assert.are.equal(0, posts.n) -- still refuses the post either way
+    vim.cmd("tabclose")
+    close_diffview_and_wait()
+  end)
+
+  it("refuses to post when active.json can't be written after the worktree and batch moved", function()
+    -- Item 3 regression: state.write_active errors rather than returning a status, and it ran
+    -- AFTER the worktree rebase and the batch pin had already moved to the new head — an
+    -- uncaught error there escaped _sheet_post with the worktree/pin moved and active.json stale.
+    local prkey = open_sheet_with_one_comment()
+    local wt = state.worktree_path(prkey)
+    local pinned = state.load_or_init_batch(prkey).pr.head_sha
+    local active_before = state.read_active().head_sha
+    local posts = count_posts()
+    pr._claude = { win = nil, buf = 1, job = 99 }
+    local sent
+    vim.api.nvim_chan_send = function(_, data)
+      sent = data
+    end
+    vim.fn.confirm = function()
+      return 1
+    end
+
+    -- a clean (non-conflicting) head move, so move_to_head reaches write_active
+    local moved_sha = sh("git -C " .. root .. "/seed rev-parse HEAD")
+    gh.pr_info = function()
+      return { base = "master", head_sha = moved_sha }
+    end
+
+    local real_write_active = state.write_active
+    state.write_active = function()
+      error("disk full")
+    end
+
+    local errored
+    local real_notify = vim.notify
+    vim.notify = function(msg, lvl)
+      if lvl == vim.log.levels.ERROR then
+        errored = msg
+      end
+    end
+    pr._sheet_post()
+    vim.notify = real_notify
+    state.write_active = real_write_active
+
+    assert.is_truthy(errored)
+    assert.is_truthy(errored:find("active.json", 1, true))
+    assert.is_truthy(errored:find("not posted", 1, true))
+    assert.are.equal(0, posts.n) -- nothing posted
+    assert.is_nil(sent) -- Claude was never asked to re-anchor against inconsistent state
+    assert.is_nil(pr._sheet_wait)
+    -- the worktree and batch pin DID move (that already happened before write_active ran);
+    -- this documents the inconsistency the notify names, not a claim that nothing moved
+    assert.are_not.equal(pinned, state.load_or_init_batch(prkey).pr.head_sha)
+    assert.are.equal(moved_sha, sh("git -C " .. wt .. " rev-parse HEAD"))
+    -- active.json is the one piece that did NOT move, since the stubbed write never landed
+    assert.are.equal(active_before, state.read_active().head_sha)
     vim.cmd("tabclose")
     close_diffview_and_wait()
   end)

@@ -189,9 +189,24 @@ function M.validate(decoded)
   -- then can't match, so the entry comes back as a new comment and the original counts as a
   -- drop. Give any such entry a real one instead. Assigned after the loop above so alloc_id's
   -- legacy seeding never walks a malformed entry.
+  -- alloc_id only rescans existing ids to seed next_id when next_id is nil (see above); a
+  -- foreign batch whose next_id LAGS its own ids (e.g. next_id=2 alongside an existing "c2")
+  -- would otherwise be handed that same id here, and sheet.parse then rejects the whole
+  -- document as a duplicate. Track ids already in use and skip past any collision.
+  local ids_in_use = {}
+  for _, c in ipairs(kept) do
+    if type(c.id) == "string" then
+      ids_in_use[c.id] = true
+    end
+  end
   for _, c in ipairs(kept) do
     if type(c.id) ~= "string" then
-      c.id = M.alloc_id(decoded)
+      local id
+      repeat
+        id = M.alloc_id(decoded)
+      until not ids_in_use[id]
+      ids_in_use[id] = true
+      c.id = id
     end
   end
   return decoded
