@@ -1126,6 +1126,36 @@ describe("ai-review end-to-end", function()
     close_diffview_and_wait()
   end)
 
+  it("PrReviewSheet stays writable across repeated :w", function()
+    -- A truthy return from an autocmd callback DELETES the autocmd, and save_sheet returns
+    -- `true, dropped`. Passed directly as the BufWriteCmd callback, the second :w died with
+    -- E676 and left the buffer permanently `modified` — which permanently disarms the
+    -- stale-sheet guard that protects comments Claude added behind the sheet.
+    local prkey, sheet_state = open_sheet_with_one_comment()
+    local function rewrite_body(text)
+      local lines = vim.api.nvim_buf_get_lines(sheet_state.buf, 0, -1, false)
+      for i, l in ipairs(lines) do
+        if l:find("edit", 1, true) or l == "original" then
+          lines[i] = text
+        end
+      end
+      vim.api.nvim_buf_set_lines(sheet_state.buf, 0, -1, false, lines)
+      vim.api.nvim_buf_call(sheet_state.buf, function()
+        vim.cmd("write")
+      end)
+    end
+    rewrite_body("edit one")
+    assert.are.equal("edit one", state.load_or_init_batch(prkey).comments[1].body)
+    rewrite_body("edit two") -- this is the write that used to fail
+    assert.are.equal("edit two", state.load_or_init_batch(prkey).comments[1].body)
+    rewrite_body("edit three")
+    assert.are.equal("edit three", state.load_or_init_batch(prkey).comments[1].body)
+    assert.is_false(vim.bo[sheet_state.buf].modified) -- else the stale-sheet guard is disarmed
+    assert.is_true(#vim.api.nvim_get_autocmds({ event = "BufWriteCmd", buffer = sheet_state.buf }) > 0)
+    vim.cmd("tabclose")
+    close_diffview_and_wait()
+  end)
+
   it("PrReviewSheet rejects a :w it cannot parse, leaving the batch untouched", function()
     local prkey = open_sheet_with_one_comment()
     local warned

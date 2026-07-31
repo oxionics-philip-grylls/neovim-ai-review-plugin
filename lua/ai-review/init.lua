@@ -1309,7 +1309,17 @@ function M.sheet()
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, sheet.render(b))
   vim.bo[buf].modified = false
   M._sheet = { buf = buf, tab = tab, code_win = code_win, sheet_win = sheet_win, pr = pr_ }
-  vim.api.nvim_create_autocmd("BufWriteCmd", { buffer = buf, callback = save_sheet })
+  -- Wrapped, NOT `callback = save_sheet`: a truthy return from an autocmd callback DELETES the
+  -- autocmd, and save_sheet returns `true, dropped` on success. Passing it directly made the
+  -- second :w fail with E676 and leave the buffer permanently `modified` — which in turn
+  -- permanently disarms _sheet_post's stale-sheet guard, the thing protecting comments Claude
+  -- added behind the sheet.
+  vim.api.nvim_create_autocmd("BufWriteCmd", {
+    buffer = buf,
+    callback = function()
+      save_sheet()
+    end,
+  })
   vim.api.nvim_create_autocmd("CursorMoved", { buffer = buf, callback = sync_code_pane })
   vim.api.nvim_create_autocmd("BufWipeout", {
     buffer = buf,
