@@ -65,6 +65,7 @@ With [lazy.nvim](https://github.com/folke/lazy.nvim):
     "PrSuggest",
     "PrReviewRefresh",
     "PrReviewSubmit",
+    "PrReviewVerdict",
     "PrReviewSheet",
     "PrClaude",
   },
@@ -92,13 +93,15 @@ reference.
 | `:PrSuggest` | visual | Opens a scratch buffer to edit the selection; `:w` stages a draft suggestion |
 | `:PrReviewRefresh` | | Re-renders the batch's virtual-text overlay on the diff |
 | `:PrReviewSheet` | | Opens the review sheet (the batch as one editable document, code beside it) |
+| `:PrReviewVerdict` | | Picks the verdict (`APPROVE` / `COMMENT` / `REQUEST_CHANGES`); updates the sheet's `# verdict:` line if it's open |
 | `:PrReviewSubmit` | | Runs the pre-flight warnings, then opens the review sheet — the post happens from there |
 | `:PrClaude` | | Jumps to the Claude `/peer-review` terminal tab |
 | `:PrReviewClose` | | Ends the review: removes the worktree, closes the sheet, tree and Claude pane |
 
 Default keymaps (from the lazy spec above): `<leader>rc` comment,
 `<leader>rs` suggest (visual), `<leader>rr` refresh, `<leader>rS` submit.
-Inside the review sheet, `<leader>p` is the two-press post (see above).
+Inside the review sheet: `<leader>p` posts (press twice — once to re-anchor, once
+to post), `<leader>v` picks the verdict.
 
 ## The `checkout-pr-review` launcher
 

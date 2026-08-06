@@ -10,6 +10,7 @@ return {
     "PrSuggest",
     "PrReviewRefresh",
     "PrReviewSubmit",
+    "PrReviewVerdict",
     "PrReviewSheet",
     "PrClaude",
   },

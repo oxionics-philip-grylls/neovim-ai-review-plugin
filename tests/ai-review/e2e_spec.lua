@@ -1332,6 +1332,93 @@ describe("ai-review end-to-end", function()
     close_diffview_and_wait()
   end)
 
+  describe(":PrReviewVerdict", function()
+    it("errors instead of prompting when there is no active review", function()
+      -- current_pr is module state that outlives a test unless something closes the
+      -- review; the previous test's worktree is already gone (after_each deleted troot),
+      -- so PrReviewClose's cleanup runs with nothing to confirm and leaves current_pr nil.
+      vim.cmd("PrReviewClose")
+      local prompted = false
+      vim.ui.select = function()
+        prompted = true
+      end
+      local err
+      local real_notify = vim.notify
+      vim.notify = function(msg, lvl)
+        if lvl == vim.log.levels.ERROR then
+          err = msg
+        end
+      end
+      vim.cmd("PrReviewVerdict")
+      vim.notify = real_notify
+      assert.is_false(prompted)
+      assert.is_truthy(err and err:find("no active review", 1, true))
+    end)
+
+    it("sets and persists the verdict without a sheet open", function()
+      pr.start("https://github.com/test/repo/pull/1")
+      local prkey = { owner = "test", repo = "repo", number = 1 }
+      vim.ui.select = function(items, _, cb)
+        assert.are.same({ "COMMENT", "REQUEST_CHANGES", "APPROVE" }, items)
+        cb("REQUEST_CHANGES", 2)
+      end
+      vim.cmd("PrReviewVerdict")
+      assert.are.equal("REQUEST_CHANGES", state.load_or_init_batch(prkey).verdict)
+      close_diffview_and_wait()
+    end)
+
+    it("cancelling the picker changes nothing", function()
+      local prkey = open_sheet_with_one_comment() -- verdict = COMMENT
+      vim.ui.select = function(_, _, cb)
+        cb(nil) -- cancelled
+      end
+      local rendered_before = table.concat(vim.api.nvim_buf_get_lines(pr._sheet.buf, 0, -1, false), "\n")
+      vim.cmd("PrReviewVerdict")
+      assert.are.equal("COMMENT", state.load_or_init_batch(prkey).verdict)
+      assert.are.equal(rendered_before, table.concat(vim.api.nvim_buf_get_lines(pr._sheet.buf, 0, -1, false), "\n"))
+      vim.cmd("tabclose")
+      close_diffview_and_wait()
+    end)
+
+    it("re-renders an open, unmodified sheet so its # verdict: line updates in place", function()
+      local prkey, sheet_state = open_sheet_with_one_comment() -- verdict = COMMENT
+      assert.is_false(vim.bo[sheet_state.buf].modified)
+      vim.ui.select = function(_, _, cb)
+        cb("APPROVE", 3)
+      end
+      vim.cmd("PrReviewVerdict")
+      assert.are.equal("APPROVE", state.load_or_init_batch(prkey).verdict)
+      local rendered = vim.api.nvim_buf_get_lines(sheet_state.buf, 0, -1, false)
+      assert.are.equal("# verdict: APPROVE", rendered[1])
+      assert.is_false(vim.bo[sheet_state.buf].modified) -- a re-render, not a human edit
+      vim.cmd("tabclose")
+      close_diffview_and_wait()
+    end)
+
+    it("patches only the verdict line of a MODIFIED sheet, never clobbering the human's edits", function()
+      local prkey, sheet_state = open_sheet_with_one_comment() -- verdict = COMMENT
+      local lines = vim.api.nvim_buf_get_lines(sheet_state.buf, 0, -1, false)
+      lines[#lines + 1] = "an unsaved thought the picker must not discard"
+      vim.api.nvim_buf_set_lines(sheet_state.buf, 0, -1, false, lines)
+      assert.is_true(vim.bo[sheet_state.buf].modified)
+
+      vim.ui.select = function(_, _, cb)
+        cb("REQUEST_CHANGES", 2)
+      end
+      vim.cmd("PrReviewVerdict")
+
+      -- the batch is updated regardless of what's on screen
+      assert.are.equal("REQUEST_CHANGES", state.load_or_init_batch(prkey).verdict)
+      local rendered = vim.api.nvim_buf_get_lines(sheet_state.buf, 0, -1, false)
+      assert.are.equal("# verdict: REQUEST_CHANGES", rendered[1]) -- the header line updated in place
+      assert.are.equal("an unsaved thought the picker must not discard", rendered[#rendered]) -- and the edit survived
+      assert.is_true(vim.bo[sheet_state.buf].modified) -- still unsaved; the picker didn't fold it in
+
+      vim.cmd("tabclose!") -- discard the deliberately-unsaved test edit
+      close_diffview_and_wait()
+    end)
+  end)
+
   -- Count `gh api` POSTs without touching the network; every other gh.run call (the real
   -- git plumbing the harness depends on) passes through. gh.run is restored in after_each.
   local function count_posts(stdout)
@@ -1383,6 +1470,59 @@ describe("ai-review end-to-end", function()
     assert.are.equal(3, after.comments[1].line) -- Claude's corrected anchor, not the stale one
     assert.is_nil(pr._sheet_wait) -- the one-shot watcher was disarmed
 
+    vim.cmd("tabclose")
+    close_diffview_and_wait()
+  end)
+
+  it("submits the re-anchor request as two writes: the body immediately, \\r on a deferred tick", function()
+    -- Regression for the bug where msg .. "\r" in one write left the message sitting
+    -- unsubmitted in Claude's input box: Claude's input handler needs an event-loop
+    -- tick between the text and the Enter for anything longer than a short nudge.
+    open_sheet_with_one_comment()
+    pr._claude = { win = nil, buf = 1, job = 99 }
+    local posts = count_posts('{"id":7}')
+    local sends = {}
+    vim.api.nvim_chan_send = function(chan, data)
+      sends[#sends + 1] = { chan = chan, data = data }
+    end
+
+    pr._sheet_post()
+    -- synchronously: only the body has gone out, and it does NOT carry the "\r" itself
+    assert.are.equal(1, #sends)
+    assert.is_truthy(sends[1].data:lower():find("re%-anchor"))
+    assert.is_nil(sends[1].data:find("\r", 1, true))
+    assert.are.equal(0, posts.n)
+
+    vim.wait(300, function()
+      return #sends == 2
+    end, 10)
+    assert.are.equal(2, #sends) -- the deferred write landed
+    assert.are.equal("\r", sends[2].data)
+    assert.are.equal(99, sends[2].chan)
+    assert.are.equal(0, posts.n) -- the two writes alone still post nothing
+    vim.cmd("tabclose")
+    close_diffview_and_wait()
+  end)
+
+  it("tells the human where to watch and that nothing posts until Claude answers", function()
+    -- The re-anchor wait can run up to 120s with no other feedback; the human needs to
+    -- know :PrClaude shows progress and that silence until then is expected, not stuck.
+    open_sheet_with_one_comment()
+    pr._claude = { win = nil, buf = 1, job = 99 }
+    vim.api.nvim_chan_send = function() end
+    local msg
+    local real_notify = vim.notify
+    vim.notify = function(m)
+      if type(m) == "string" and m:find("asked Claude to re%-anchor", 1, false) then
+        msg = m
+      end
+    end
+    pr._sheet_post()
+    vim.notify = real_notify
+
+    assert.is_truthy(msg)
+    assert.is_truthy(msg:find(":PrClaude", 1, true))
+    assert.is_truthy(msg:lower():find("nothing will post until claude answers", 1, true))
     vim.cmd("tabclose")
     close_diffview_and_wait()
   end)

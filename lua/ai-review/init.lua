@@ -30,6 +30,24 @@ M._sheet = nil
 ---@type uv.uv_fs_event_t?
 M._sheet_wait = nil
 
+--- Write `msg` to a terminal channel, then a bare `\r` on a short deferred tick.
+--- Claude's input handler needs an event-loop pass to consume the text before Enter
+--- registers as submit: sending `msg .. "\r"` in a single write leaves anything longer
+--- than a short nudge sitting unsubmitted in the input box (confirmed by driving the
+--- real `claude` binary in a pty — 50ms was already enough; 100ms is comfortable
+--- headroom and still imperceptible). Every send to Claude's terminal must go through
+--- this, not a raw `nvim_chan_send(job, msg .. "\r")`.
+---@param job integer
+---@param msg string
+---@return boolean ok whether the first (body) write succeeded
+local function send_and_submit(job, msg)
+  local ok = pcall(vim.api.nvim_chan_send, job, msg)
+  vim.defer_fn(function()
+    pcall(vim.api.nvim_chan_send, job, "\r")
+  end, 100)
+  return ok
+end
+
 --- Stop the batch fs-watcher (idempotent).
 function M._stop_watch()
   if M._watch then
@@ -527,7 +545,7 @@ function M.start(arg)
     send = function(msg)
       -- write straight to Claude's stdin; no-op if the terminal's gone
       if M._claude and M._claude.job then
-        pcall(vim.api.nvim_chan_send, M._claude.job, msg .. "\r")
+        send_and_submit(M._claude.job, msg)
       end
     end,
     schedule = function(ms, fn)
@@ -1572,7 +1590,7 @@ function M._sheet_post()
       return
     end
   end
-  if not pcall(vim.api.nvim_chan_send, M._claude.job, nudge.reanchor_request_msg(state.batch_path(s.pr)) .. "\r") then
+  if not send_and_submit(M._claude.job, nudge.reanchor_request_msg(state.batch_path(s.pr))) then
     if new_head then
       -- Nothing will re-anchor now, so the anchors still describe `pinned` and `commit_id` must
       -- too. The worktree and active.json stay on the new head: they aren't part of the payload,
@@ -1581,7 +1599,9 @@ function M._sheet_post()
     end
     return without_reanchor("Couldn't send to the Claude session.")
   end
-  vim.notify("prreview: asked Claude to re-anchor — waiting, nothing posted yet")
+  vim.notify(
+    "prreview: asked Claude to re-anchor — watch progress with :PrClaude; nothing will post until Claude answers"
+  )
   wait_for_reanchor(s.pr)
 end
 
@@ -1644,7 +1664,43 @@ function M.sheet()
     end,
   })
   vim.keymap.set("n", "<leader>p", M._sheet_post, { buffer = buf, desc = "prreview: post this review" })
+  vim.keymap.set("n", "<leader>v", M.verdict, { buffer = buf, desc = "prreview: set the verdict" })
   sync_code_pane()
+end
+
+--- Set the batch's verdict from a picker — the standalone command the sheet's `# verdict:`
+--- line replaced, brought back for anyone who wants to set it without opening the sheet.
+--- Works any time during an active review.
+function M.verdict()
+  if not current_pr then
+    vim.notify("prreview: no active review (:PrReviewStart)", vim.log.levels.ERROR)
+    return
+  end
+  local pr_ = current_pr
+  vim.ui.select({ "COMMENT", "REQUEST_CHANGES", "APPROVE" }, { prompt = "Verdict:" }, function(verdict)
+    if not verdict then
+      return
+    end
+    local b = state.load_or_init_batch(pr_)
+    b.verdict = verdict
+    state.save_batch(b)
+    local s = M._sheet
+    if not (s and s.pr == pr_ and vim.api.nvim_buf_is_valid(s.buf)) then
+      return
+    end
+    if vim.bo[s.buf].modified then
+      -- render_sheet replaces the WHOLE buffer, so a modified sheet must not go through it —
+      -- that would cost the human whatever else they've typed and not saved. The `# verdict:`
+      -- line is always line 1 (sheet.render emits it first, sheet.parse requires it before any
+      -- other section), so patch just that line instead of forcing a reload.
+      vim.api.nvim_buf_set_lines(s.buf, 0, 1, false, { "# verdict: " .. verdict })
+      if s.shown then
+        s.shown.verdict = verdict
+      end
+    else
+      render_sheet(s, b)
+    end
+  end)
 end
 
 function M.submit()
@@ -1716,6 +1772,7 @@ function M.setup(opts)
   vim.api.nvim_create_user_command("PrComments", M.comments, {})
   vim.api.nvim_create_user_command("PrClaude", M.claude, {})
   vim.api.nvim_create_user_command("PrReviewSheet", M.sheet, {})
+  vim.api.nvim_create_user_command("PrReviewVerdict", M.verdict, {})
   vim.api.nvim_create_user_command("PrReviewed", M.toggle_reviewed, {})
   vim.api.nvim_create_user_command("PrReviewRefresh", function()
     if current_pr then
